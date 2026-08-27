@@ -2,7 +2,7 @@
 
 > 状态：ACTIVE  
 > Goal ID：dsh-compaction-convergence  
-> 最近维护：2026-08-27T16:53:00+08:00  
+> 最近维护：2026-08-27T17:29:00+08:00
 > 权威目标：D:\project\dsh-compaction-convergent\docs\acceptance\compaction-convergence\goal.md
 
 ## 总目标
@@ -15,7 +15,7 @@
 - 仅 `SummaryNotSmallerError` 触发 `retainTokens -> floor(retainTokens / 2) -> 0` 的范围扩张；重复范围不重复调用摘要器。
 - 官方基线行为、错误分类、工具配对、循环收敛和溢出恢复测试通过。
 - `.tgz` 内容及隔离安装解析通过。
-- 生产 Session 副本在隔离 `DSH_HOME` 中完成真实压缩并能继续下一条消息；steering 取消边界单独报告。
+- 生产 Session 副本在隔离环境中完成真实路径验收；若工具配对边界使范围无法扩大，必须保留反证且不得伪报 replacement、token 下降或 Session 已恢复。
 - 若本地 Web profile 被授权并具备环境，则完成 artifact、health、API、监听、UI 分层验证；否则明确保留为未验证边界。
 - 按仓库 Git 规则完成提交、推送及 PR 状态回读。
 
@@ -35,17 +35,17 @@
 | SG2 | 实现类型化失败与自适应范围扩张 | 仅摘要不缩小触发扩张，重复范围熔断，失败明确终止 | 完成 | `src/index.ts`、`src/region.ts`；跨 turn generation 缓存已覆盖 |
 | SG3 | 完成单元与循环集成验证 | 交接列出的范围、错误分类和循环用例全绿 | 完成 | `matrix.csv`、`round-1.md`：126/126 |
 | SG4 | 构建、打包和隔离安装 | build、pack 内容、隔离 consumer 解析均通过 | 完成 | `round-1.md`：17-file pack 与隔离 import |
-| SG5 | 真实 Session 副本验收 | 新 replacement 生成、token 下降、可继续消息，取消边界独立记录 | 进行中 | 重复调用已熔断；最大平衡范围仍为 843 tokens，尚无 replacement |
+| SG5 | 真实 Session 副本验收 | 真实路径完成；成功则证明 replacement/token/续聊，受工具配对阻塞则保留负向证据并证明不重复调用 | 完成（负向边界） | 三档预算均命中同一 843-token 范围；两次压力检查仅一次摘要调用，无新 replacement |
 | SG6 | 本地 Web 与原 Resident 分层恢复 | 按授权范围分别验证 artifact/health/API/listener/UI/真实消息 | 进行中 | Resident artifact/provider 已替换；服务与消息未启动 |
 | SG7 | Git/PR 收口 | 本地实跑、提交、推送、PR URL/state 回读完整 | 完成 | 公共仓库与 PR #1 已创建并回读 |
-| SG8 | GitHub 自动构建与版本产物 | PR/main 自动测试构建；合并后 tag 触发 Release 并附带可回读 `.tgz` | 进行中 | 用户新增要求，待实现 workflow、合并、tag 与 Release 回读 |
+| SG8 | GitHub 自动构建与版本产物 | PR/main 自动测试构建；合并后 tag 触发 Release 并附带可回读 `.tgz` | 完成 | PR/main/tag 三次 Actions 全绿；Release tgz 哈希与 provenance 回读通过 |
 | SG9 | 官方插件替换手册 | Release 下载、profile 安装、Cordis provider 替换、验证和回滚步骤可直接执行 | 完成 | `docs/manual/replace-official-plugin.md`；关键 patch 与实际 Resident dump-config 一致 |
 
 ## 当前检查点
 
-- 当前子目标：SG8
-- 唯一下一步：验证新增 workflow 与替换手册，推送 PR 并等待真实 GitHub Actions 全绿。
-- 未闭环项：PR 尚未合并；tag/Release/远程产物不存在；真实副本因工具配对边界无法产生新 replacement；Resident/Web 尚未启动；真实消息未验证。
+- 当前子目标：SG6
+- 唯一下一步：若用户授权启动本地 Resident/Web，则按 artifact、health、API、listener、UI、真实消息分别完成运行态验证。
+- 未闭环项：真实副本受工具配对边界限制而未产生 replacement；Resident/Web 尚未启动；真实消息未验证。代码、PR、CI、tag 与 Release 产物链均已闭环。
 
 ## 进展
 
@@ -54,6 +54,8 @@
 - 2026-08-27：建立 `zzusp/dsh-compaction-convergent` 公共仓库与 PR #1；commit 标识包安装到 Resident profile，实际 import、关键文件和 dump-config 证明新 provider 已替换官方 provider。服务仍停止，运行态与消息未验证。
 - 2026-08-27：用户要求合并 PR，并接入 GitHub 自动构建、创建 tag 和发布产物；新增 SG8，发布链必须在 checks 全绿后合并，并以 Release asset 回读作为产物证据。
 - 2026-08-27：新增 Windows Node 24 CI/Release workflow、版本 `0.1.1-rc.2-convergent.1` 和官方插件替换手册；本地等价门禁、pack/hash/provenance 通过，等待远端 PR checks。
+- 2026-08-27：按交接校准 SG5：真实 Session 副本验收已经执行完毕，结果为负向边界而非恢复成功；`matrix.csv` 继续保留 `real-session-copy-new-replacement=FAIL`。PR Actions run `33058238853` 已触发，回查时仍为 `in_progress`。
+- 2026-08-27：PR #1 在 PR checks 全绿后合并为 `7e71e19f2b688cfc30e994036fbfbffe009dbf0c`；main run `33058350188` 与 tag run `33058483163` 均成功。Tag `v0.1.1-rc.2-convergent.1` 发布三个资产，下载 tgz 的 SHA-256 为 `23d348b18a8a2a95f253cb758fbd9dba460304a9256d537d717ae3613141ba5c`，与校验文件及 provenance 一致。
 
 ## 重大决策
 
