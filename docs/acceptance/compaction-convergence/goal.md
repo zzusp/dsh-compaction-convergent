@@ -36,7 +36,7 @@
 | SG3 | 完成单元与循环集成验证 | 交接列出的范围、错误分类和循环用例全绿 | 完成 | `matrix.csv`、`round-1.md`：126/126 |
 | SG4 | 构建、打包和隔离安装 | build、pack 内容、隔离 consumer 解析均通过 | 完成 | `round-1.md`：17-file pack 与隔离 import |
 | SG5 | 真实 Session 副本验收 | 真实路径完成；成功则证明 replacement/token/续聊，受工具配对阻塞则保留负向证据并证明不重复调用 | 完成（负向边界） | 三档预算均命中同一 843-token 范围；两次压力检查仅一次摘要调用，无新 replacement |
-| SG6 | 本地 Web 与原 Resident 分层恢复 | 按授权范围分别验证 artifact/health/API/listener/UI/真实消息 | 进行中 | Resident artifact/provider 已替换；服务与消息未启动 |
+| SG6 | 本地 Web 与原 Resident 分层恢复 | 按授权范围分别验证 artifact/health/API/listener/UI/真实消息 | 进行中 | Resident 已安装 `convergent.2` 且 provider 配置接管；用户要求只安装，服务与消息未启动 |
 | SG7 | Git/PR 收口 | 本地实跑、提交、推送、PR URL/state 回读完整 | 完成 | 公共仓库与 PR #1 已创建并回读 |
 | SG8 | GitHub 自动构建与版本产物 | PR/main 自动测试构建；合并后 tag 触发 Release 并附带可回读 `.tgz` | 完成 | PR/main/tag 三次 Actions 全绿；Release tgz 哈希与 provenance 回读通过 |
 | SG9 | 官方插件替换手册 | Release 下载、profile 安装、Cordis provider 替换、验证和回滚步骤可直接执行 | 完成 | `docs/manual/replace-official-plugin.md`；关键 patch 与实际 Resident dump-config 一致 |
@@ -45,8 +45,8 @@
 ## 当前检查点
 
 - 当前子目标：SG6
-- 唯一下一步：等待并合并 PR #3；发布并安装 `convergent.2` 后，若用户授权启动 Resident/Web，则按 artifact、health、API、listener、UI、真实消息分别完成运行态验证。
-- 未闭环项：PR #3 尚未合并；真实模型摘要质量尚未在该副本验证；本轮修复尚未发布和安装；Resident/Web 尚未启动；真实消息未验证。
+- 唯一下一步：等待并合并 PR #3；若用户后续明确要求启动 Resident/Web，再按 health、API、listener、UI、真实消息分别完成运行态验证。
+- 未闭环项：PR #3 尚未合并和正式发布；真实模型摘要质量尚未在该副本验证；按用户当前范围 Resident/Web 不启动，真实消息未验证。
 
 ## 进展
 
@@ -60,6 +60,7 @@
 - 2026-08-27：用户要求修复范围选择并用原问题 Session 的新副本验证；新增 SG10。已定位 `retainTokens=0` 仍先保留最新节点，使零预算无法覆盖整个最新闭合 surface，原先“历史 Session 本身无法收敛”的结论需由本轮实跑重新判定。
 - 2026-08-27：进一步反证发现最大范围仍只有 843 tokens；真实根因是 `seq 338` 两个已闭合步骤 `group_task_create` 调用从未落 result，造成其后所有官方计数边界永久不平衡。修复仅在最终摘要输入中临时闭合这类孤儿调用；问题 Session 新副本完成 replacement，131,393 → 11,926 tokens，持久化重载及后续消息追加通过，原 Session 哈希不变。
 - 2026-08-27：提交 `48e6398` 并创建 PR #3；远端 Node 24 run `33062368121` 完成 typecheck、128 tests、build、pack 与 artifact 上传，结论 SUCCESS。PR 回读为 OPEN / MERGEABLE。
+- 2026-08-27：用户要求只安装、不启动。当前 PR artifact 已安装到 Resident，实际 import 回读 `0.1.1-rc.2-convergent.2 / Node v24.19.0`；安装/source `lib/region.js` SHA-256 同为 `76B6E6068E9BE40EBE43ACC6DD4A0F626CFBC1F1E5A86B9EE701CD5DAAFA3C34`，dump-config 保持官方 provider disabled、新 provider inserted。`3080/18998` 无监听，未声称运行态成功。
 
 ## 重大决策
 

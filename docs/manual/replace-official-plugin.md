@@ -24,7 +24,7 @@ gh release download <version> `
 以下示例使用 `resident` profile：
 
 ```powershell
-$package = Get-ChildItem -LiteralPath $releaseDir -Filter '*.tgz' | Select-Object -Single
+$package = Get-ChildItem -LiteralPath $releaseDir -Filter '*.tgz' | Select-Object -First 1
 dsh plugin --profile resident add $package.FullName
 ```
 

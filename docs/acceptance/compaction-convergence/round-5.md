@@ -24,6 +24,8 @@
 - 待发布包版本：`0.1.1-rc.2-convergent.2`。
 - `npm pack`：18 files、35,973 bytes；SHA-256 `1EEEDD6621D057AE03C416C507E330B2BABD7E0FF85F9915733E3F069264EEAF`，包内包含官方插件替换手册。
 - GitHub PR #3 首次 run `33062368121`：Node 24 quality and package SUCCESS，远端完成 typecheck、tests、build、pack 与 artifact 上传。
+- Resident 安装回读：`@zzusp/dsh-compaction-convergent 0.1.1-rc.2-convergent.2 / Node v24.19.0`；安装/source `lib/region.js` SHA-256 均为 `76B6E6068E9BE40EBE43ACC6DD4A0F626CFBC1F1E5A86B9EE701CD5DAAFA3C34`。
+- `dump-config`：官方 `compaction-basic` 为 `disabled: true`，`compaction-convergent` 指向本包。用户将范围收窄为只安装，未启动服务；`3080/18998` 无监听。
 
 ## 边界
 
