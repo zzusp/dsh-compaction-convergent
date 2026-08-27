@@ -38,18 +38,22 @@
 | SG5 | 真实 Session 副本验收 | 新 replacement 生成、token 下降、可继续消息，取消边界独立记录 | 进行中 | 重复调用已熔断；最大平衡范围仍为 843 tokens，尚无 replacement |
 | SG6 | 本地 Web 与原 Resident 分层恢复 | 按授权范围分别验证 artifact/health/API/listener/UI/真实消息 | 进行中 | Resident artifact/provider 已替换；服务与消息未启动 |
 | SG7 | Git/PR 收口 | 本地实跑、提交、推送、PR URL/state 回读完整 | 完成 | 公共仓库与 PR #1 已创建并回读 |
+| SG8 | GitHub 自动构建与版本产物 | PR/main 自动测试构建；合并后 tag 触发 Release 并附带可回读 `.tgz` | 进行中 | 用户新增要求，待实现 workflow、合并、tag 与 Release 回读 |
+| SG9 | 官方插件替换手册 | Release 下载、profile 安装、Cordis provider 替换、验证和回滚步骤可直接执行 | 完成 | `docs/manual/replace-official-plugin.md`；关键 patch 与实际 Resident dump-config 一致 |
 
 ## 当前检查点
 
-- 当前子目标：SG6
-- 唯一下一步：在明确控制外部消息副作用的条件下启动 Resident/Web，分别验证 listener、health/API/UI，再决定是否恢复原 Session。
-- 未闭环项：真实副本因工具配对边界无法产生新 replacement；Resident/Web 尚未启动；真实消息未验证。
+- 当前子目标：SG8
+- 唯一下一步：验证新增 workflow 与替换手册，推送 PR 并等待真实 GitHub Actions 全绿。
+- 未闭环项：PR 尚未合并；tag/Release/远程产物不存在；真实副本因工具配对边界无法产生新 replacement；Resident/Web 尚未启动；真实消息未验证。
 
 ## 进展
 
 - 2026-08-27：读取交接材料与本机项目约束；确认工作区仅有交接文件且不是 Git 仓库；拉取官方 master 并固定提交 `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`；代码搜索确认普通错误与固定保留预算循环仍存在。
 - 2026-08-27：独立基线 122/122；实现类型化错误、三档扩张、单检查去重与跨 turn generation 缓存；当前 126/126，build/pack/隔离安装通过。真实 Session 副本证明三档预算均为同一 843-token range，两次压力检查只调用一次摘要器，但没有 replacement。
 - 2026-08-27：建立 `zzusp/dsh-compaction-convergent` 公共仓库与 PR #1；commit 标识包安装到 Resident profile，实际 import、关键文件和 dump-config 证明新 provider 已替换官方 provider。服务仍停止，运行态与消息未验证。
+- 2026-08-27：用户要求合并 PR，并接入 GitHub 自动构建、创建 tag 和发布产物；新增 SG8，发布链必须在 checks 全绿后合并，并以 Release asset 回读作为产物证据。
+- 2026-08-27：新增 Windows Node 24 CI/Release workflow、版本 `0.1.1-rc.2-convergent.1` 和官方插件替换手册；本地等价门禁、pack/hash/provenance 通过，等待远端 PR checks。
 
 ## 重大决策
 

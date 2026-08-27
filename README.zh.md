@@ -6,6 +6,12 @@
 
 本包基于 DeepSeek Harness 提交 `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`，遵循 MIT 许可；来源见 [NOTICE.md](NOTICE.md)。
 
+## 构建与发布
+
+Pull Request 和 `main` push 会在 GitHub Actions 的 Windows Node 24 环境执行依赖锁定安装、类型检查、100% 覆盖率测试、构建和 `npm pack`，并上传与完整源码 SHA 绑定的 workflow artifact。推送与 `package.json` 版本严格一致的 `v<version>` tag 后，同一构建产物会发布到 GitHub Release，同时附带 SHA-256 和 `provenance.json`。
+
+完整替换步骤、验证与回滚方式见[《替换官方压缩插件》](docs/manual/replace-official-plugin.md)。
+
 本包承担压缩能力的 Service Provider 角色；其约定见 [Service Definition 包](../compaction/README.zh.md)，设计见 [能力 seam Agent Note](../../../.agents/notes/implemented/feature/2026-06-18-compaction-capability-seam.zh.md)。
 
 ## 拥有的职责

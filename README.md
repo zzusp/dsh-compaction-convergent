@@ -6,6 +6,12 @@ The **convergent compaction backend** is a source-compatible replacement for `@d
 
 This package is derived from DeepSeek Harness commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e` under the MIT License. See [NOTICE.md](NOTICE.md).
 
+## Build and release
+
+Pull requests and pushes to `main` run locked installation, typechecking, 100% coverage tests, build, and `npm pack` on Windows with Node 24. The workflow artifact is named with the complete source SHA. Pushing a `v<version>` tag that exactly matches `package.json` publishes that same package to a GitHub Release together with its SHA-256 file and `provenance.json`.
+
+See [Replacing the official compaction plugin](docs/manual/replace-official-plugin.md) for the exact profile patch, verification, and rollback procedure (Chinese).
+
 This package owns the Service Provider role of the compaction capability — see the [Service Definition package](../compaction/README.md) for its contract and the [capability-seam Agent Note](../../../.agents/notes/implemented/feature/2026-06-18-compaction-capability-seam.md) for the design.
 
 ## What it owns

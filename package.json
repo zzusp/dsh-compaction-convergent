@@ -1,6 +1,6 @@
 {
   "name": "@zzusp/dsh-compaction-convergent",
-  "version": "0.1.1-rc.2-convergent.6fc1379",
+  "version": "0.1.1-rc.2-convergent.1",
   "description": "Convergent replacement for the DeepSeek Harness basic compaction backend",
   "type": "module",
   "main": "lib/index.js",
@@ -22,7 +22,8 @@
     "LICENSE",
     "NOTICE.md",
     "README.md",
-    "README.zh.md"
+    "README.zh.md",
+    "docs/manual/replace-official-plugin.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
