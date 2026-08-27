@@ -42,11 +42,12 @@
 | SG9 | 官方插件替换手册 | Release 下载、profile 安装、Cordis provider 替换、验证和回滚步骤可直接执行 | 完成 | `docs/manual/replace-official-plugin.md`；关键 patch 与实际 Resident dump-config 一致 |
 | SG10 | 已闭合步骤孤儿调用最大范围 | 普通边界不放宽；closed-step orphan 仅在最终摘要输入中临时配对；真实模型必须在 Web 恢复追加 end-seed 前完成语义保真 replacement | 完成 | `round-6.md`：真实模型覆盖 880 nodes，131,393 → 13,527 tokens |
 | SG11 | 恢复前真实模型一次性 repair | 提供显式入口，在 Web 恢复前读取完整历史 surface、调用真实模型、原子持久化标准 replacement，并由 Web 继续恢复同一 Session ID | 进行中 | repair 入口、真实模型、原子输出与重载已通过；尚未让 Resident 从 repaired 输出恢复并续聊 |
+| SG12 | 合并 PR #3 并发布新版本 | PR checks 全绿后合并；以包版本创建新 tag，Release 资产、校验和与 provenance 可回读 | 进行中 | 用户已授权合并与新 tag；待实时回查后执行 |
 
 ## 当前检查点
 
-- 当前子目标：SG11
-- 唯一下一步：等待用户决定是否用 repaired 输出替换生产 Session；若执行，再启动 Resident 验证同 ID 恢复与真实续聊。
+- 当前子目标：SG12
+- 唯一下一步：回查 PR #3 checks 后合并，等待 main CI，再创建与 package version 一致的新 tag 并验证 Release 资产。
 - 未闭环项：生产 Session 尚未替换；Web/Resident 已停止；health/API/UI 与真实消息续聊未验证。
 
 ## 进展
@@ -65,6 +66,7 @@
 - 2026-08-27：应用侧真实回合证明 Web provider 已接管并执行两次收敛尝试，但恢复时追加的 `session/end-seed` 将在线 surface 截为约 843 tokens，provider 看不到历史 880 nodes。Resident 已修正为切换 preset 不建 seed 副本、不换 Session ID，但不能绕过 DSH 恢复边界。撤回“问题 Session 已恢复”结论：确定性占位摘要只证明 replacement 事务，不能作为真实语义验证。
 - 2026-08-27：新增一次性 `repair` Cordis 入口，强制输入哈希、Session ID、独立输出与原子重载校验。真实 adapter 先后暴露 pressure 阈值漂移、代理开关和单次全量请求溢出；最终采用工具配对平衡的分层真实摘要，问题副本 131,393 → 13,527 tokens，880 nodes replacement，八段摘要齐全。原 Session 已恢复为 `AA97…`，Web 停止且 patch 恢复。
 - 2026-08-27：repair 实现提交 `3632207` 并推送 PR #3；GitHub Node 24 run `33067193298` 完成 130 tests、typecheck、build、pack，结论 SUCCESS。PR 正文已按真实模型证据更新并回读为 OPEN / MERGEABLE。
+- 2026-08-27：用户授权合并 PR #3 并发布新 tag；新增 SG12，发布完成以合并 SHA、main/tag Actions、Release 资产和校验和回读为准。
 
 ## 重大决策
 
