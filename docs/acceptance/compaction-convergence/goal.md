@@ -36,19 +36,20 @@
 | SG3 | 完成单元与循环集成验证 | 交接列出的范围、错误分类和循环用例全绿 | 完成 | `matrix.csv`、`round-1.md`：126/126 |
 | SG4 | 构建、打包和隔离安装 | build、pack 内容、隔离 consumer 解析均通过 | 完成 | `round-1.md`：17-file pack 与隔离 import |
 | SG5 | 真实 Session 副本验收 | 新 replacement 生成、token 下降、可继续消息，取消边界独立记录 | 进行中 | 重复调用已熔断；最大平衡范围仍为 843 tokens，尚无 replacement |
-| SG6 | 本地 Web 与原 Resident 分层恢复 | 按授权范围分别验证 artifact/health/API/listener/UI/真实消息 | 待开始 | 现场服务当前停止；不得提前声称恢复 |
-| SG7 | Git/PR 收口 | 本地实跑、提交、推送、PR URL/state 回读完整 | 待开始 | 待完成 |
+| SG6 | 本地 Web 与原 Resident 分层恢复 | 按授权范围分别验证 artifact/health/API/listener/UI/真实消息 | 进行中 | Resident artifact/provider 已替换；服务与消息未启动 |
+| SG7 | Git/PR 收口 | 本地实跑、提交、推送、PR URL/state 回读完整 | 完成 | 公共仓库与 PR #1 已创建并回读 |
 
 ## 当前检查点
 
-- 当前子目标：SG5
-- 唯一下一步：完成最终覆盖率回归并安装 commit 标识 `.tgz` 到隔离/Resident profile，验证实际 provider 替换后再决定是否安全启动原 Session。
-- 未闭环项：真实副本因工具配对边界无法产生更大 range；Resident/Web/真实消息尚未验证；当前目录尚非 Git 仓库，远程仓库待建立。
+- 当前子目标：SG6
+- 唯一下一步：在明确控制外部消息副作用的条件下启动 Resident/Web，分别验证 listener、health/API/UI，再决定是否恢复原 Session。
+- 未闭环项：真实副本因工具配对边界无法产生新 replacement；Resident/Web 尚未启动；真实消息未验证。
 
 ## 进展
 
 - 2026-08-27：读取交接材料与本机项目约束；确认工作区仅有交接文件且不是 Git 仓库；拉取官方 master 并固定提交 `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`；代码搜索确认普通错误与固定保留预算循环仍存在。
 - 2026-08-27：独立基线 122/122；实现类型化错误、三档扩张、单检查去重与跨 turn generation 缓存；当前 126/126，build/pack/隔离安装通过。真实 Session 副本证明三档预算均为同一 843-token range，两次压力检查只调用一次摘要器，但没有 replacement。
+- 2026-08-27：建立 `zzusp/dsh-compaction-convergent` 公共仓库与 PR #1；commit 标识包安装到 Resident profile，实际 import、关键文件和 dump-config 证明新 provider 已替换官方 provider。服务仍停止，运行态与消息未验证。
 
 ## 重大决策
 
