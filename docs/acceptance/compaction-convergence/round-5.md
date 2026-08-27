@@ -1,0 +1,31 @@
+# Round 5：已闭合步骤孤儿调用与问题 Session 副本
+
+## 结论
+
+首次“降低保留预算”修复继续保留；本轮补上其无法解决的前置缺陷：两个已结束旧步骤工具调用缺失 result，使官方计数边界永久不平衡。修复后，问题 Session 的新副本完成最大范围 replacement，并通过持久化、重载和后续消息追加验证。
+
+## 根因证据
+
+- 原 Session：41,454 events、880 surface nodes、131,393 total tokens、120,665 surface tokens。
+- surface 中共有 60 个 tool calls、58 个 tool result events，最终欠 2。
+- 两个孤儿调用均来自 assistant message `seq 338`，名称均为 `group_task_create`；对应 step 已有持久化 `step/end`，整份日志没有对应 result。
+- 原算法所有三档预算只能选择 `31636:31636`，1 node / 843 tokens。
+
+## 修复后 PASS 证据
+
+- 最大候选范围：`31636:41446`，880 nodes / 120,665 tokens。
+- 只在摘要输入中为两个 closed-step orphan calls 插入 synthetic error results；原 Session 和副本事件中均不补写 `tool/result`。
+- 问题副本：`131,393 → 11,926 tokens`，replace generation `7 → 8`，surface `880 → 1`。
+- replacement shadowed 880 nodes / 120,665 tokens；第二次压力检查返回 `null`，没有继续压缩。
+- 持久化副本重新加载后仍为 11,926 tokens，并成功追加 `post-compaction continuation probe`。
+- 原 Session 验证前后 SHA-256 均为 `AA97FDF4F30AB03E96804435A55E6BCBD8808051F08ACC940269502725527F3F`。
+- 副本路径：`C:\Users\64554\AppData\Local\Temp\dsh-compaction-convergent-sg10\session-problem-copy.jsonl`。
+- Node 24：typecheck、128/128 tests、coverage gate、build 通过。
+- 待发布包版本：`0.1.1-rc.2-convergent.2`。
+- `npm pack`：18 files、35,973 bytes；SHA-256 `1EEEDD6621D057AE03C416C507E330B2BABD7E0FF85F9915733E3F069264EEAF`，包内包含官方插件替换手册。
+
+## 边界
+
+- 本轮使用确定性摘要器验证真实 Session 数据上的范围选择、事务、replacement、持久化与重载，不证明真实模型生成的摘要质量。
+- 当前开放步骤的未回答调用仍拒绝最大范围；正常 overflow 和手动压缩仍保留最新完整工具配对。
+- 未修改原问题 Session，未启动 Resident/Web，未执行真实消息回读。

@@ -40,12 +40,13 @@
 | SG7 | Git/PR 收口 | 本地实跑、提交、推送、PR URL/state 回读完整 | 完成 | 公共仓库与 PR #1 已创建并回读 |
 | SG8 | GitHub 自动构建与版本产物 | PR/main 自动测试构建；合并后 tag 触发 Release 并附带可回读 `.tgz` | 完成 | PR/main/tag 三次 Actions 全绿；Release tgz 哈希与 provenance 回读通过 |
 | SG9 | 官方插件替换手册 | Release 下载、profile 安装、Cordis provider 替换、验证和回滚步骤可直接执行 | 完成 | `docs/manual/replace-official-plugin.md`；关键 patch 与实际 Resident dump-config 一致 |
+| SG10 | 已闭合步骤孤儿调用最大范围 | 普通边界不放宽；closed-step orphan 仅在最终摘要输入中临时配对，并在问题 Session 新副本上观察 replacement、token 下降、可重载与续接 | 完成 | `round-5.md`：131,393 → 11,926 tokens，880 → 1 nodes，重载与追加通过 |
 
 ## 当前检查点
 
 - 当前子目标：SG6
-- 唯一下一步：若用户授权启动本地 Resident/Web，则按 artifact、health、API、listener、UI、真实消息分别完成运行态验证。
-- 未闭环项：真实副本受工具配对边界限制而未产生 replacement；Resident/Web 尚未启动；真实消息未验证。代码、PR、CI、tag 与 Release 产物链均已闭环。
+- 唯一下一步：发布并安装本轮修复后，若用户授权启动 Resident/Web，则按 artifact、health、API、listener、UI、真实消息分别完成运行态验证。
+- 未闭环项：真实模型摘要质量尚未在该副本验证；本轮修复尚未合并发布和安装；Resident/Web 尚未启动；真实消息未验证。
 
 ## 进展
 
@@ -56,12 +57,15 @@
 - 2026-08-27：新增 Windows Node 24 CI/Release workflow、版本 `0.1.1-rc.2-convergent.1` 和官方插件替换手册；本地等价门禁、pack/hash/provenance 通过，等待远端 PR checks。
 - 2026-08-27：按交接校准 SG5：真实 Session 副本验收已经执行完毕，结果为负向边界而非恢复成功；`matrix.csv` 继续保留 `real-session-copy-new-replacement=FAIL`。PR Actions run `33058238853` 已触发，回查时仍为 `in_progress`。
 - 2026-08-27：PR #1 在 PR checks 全绿后合并为 `7e71e19f2b688cfc30e994036fbfbffe009dbf0c`；main run `33058350188` 与 tag run `33058483163` 均成功。Tag `v0.1.1-rc.2-convergent.1` 发布三个资产，下载 tgz 的 SHA-256 为 `23d348b18a8a2a95f253cb758fbd9dba460304a9256d537d717ae3613141ba5c`，与校验文件及 provenance 一致。
+- 2026-08-27：用户要求修复范围选择并用原问题 Session 的新副本验证；新增 SG10。已定位 `retainTokens=0` 仍先保留最新节点，使零预算无法覆盖整个最新闭合 surface，原先“历史 Session 本身无法收敛”的结论需由本轮实跑重新判定。
+- 2026-08-27：进一步反证发现最大范围仍只有 843 tokens；真实根因是 `seq 338` 两个已闭合步骤 `group_task_create` 调用从未落 result，造成其后所有官方计数边界永久不平衡。修复仅在最终摘要输入中临时闭合这类孤儿调用；问题 Session 新副本完成 replacement，131,393 → 11,926 tokens，持久化重载及后续消息追加通过，原 Session 哈希不变。
 
 ## 重大决策
 
 - 以官方完整 `compaction-basic` 包为基线重命名，不 monkey patch、不重写事务层；原因是官方只开放 summarizer 子类钩子，范围选择和事务语义必须整体兼容。
 - 第一版将扩张预算固定为 `[1, 0.5, 0]`，暂不公开新配置；减少配置面并直接覆盖已确认故障。
 - 失败范围缓存以 `Session` 弱引用保存，并用 `surface.replaceGeneration` 自动换代；既不跨 Session 泄漏，也不会在表层已前进后错误熔断新尝试。
+- 首次范围扩张和熔断继续保留；本轮不把 `retainTokens=0` 全局改成整面压缩，因为回归证明这会破坏 overflow 保留最新完整步骤。最大整面候选只在普通范围发生不缩小后启用，且仅容忍已有持久化 `step/end` 的孤儿调用。
 
 ## 重要信息
 

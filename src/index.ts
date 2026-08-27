@@ -26,6 +26,7 @@ import {
   assertNoActiveCompaction,
   compactSurfaceRegion,
   selectCompactableRange,
+  selectMaximalCompactableRange,
   SummaryNotSmallerError,
 } from './region.ts'
 import { summarizeWithLlm } from './summarizer.ts'
@@ -364,6 +365,34 @@ export class BasicCompactionEngine extends CompactionEngine {
         }
       }
 
+      if (!compacted && (nonShrinking !== undefined || cachedNonShrinking)) {
+        measurement = meter.measure(agent.session)
+        const range = selectMaximalCompactableRange(agent.session, measurement)
+        if (range !== null) {
+          const startIdx = measurement.nodes.findIndex(node => node.seq === range.start)
+          const endIdx = measurement.nodes.findIndex(node => node.seq === range.end)
+          const selectedTokens = measurement.nodes
+            .slice(startIdx, endIdx + 1)
+            .reduce((total, node) => total + node.tokens, 0)
+          if (measurement.totalTokens - selectedTokens < spec.thresholdTokens) {
+            const rangeKey = `${range.start}:${range.end}`
+            if (!attemptedRanges.has(rangeKey) && !failedRanges.has(rangeKey)) {
+              attemptedRanges.add(rangeKey)
+              try {
+                result = await this.compactRegion(range.start, range.end, agent, signal, true)
+                compacted = true
+              } catch (error: unknown) {
+                if (!(error instanceof SummaryNotSmallerError)) throw error
+                nonShrinking = error
+                failedRanges.add(rangeKey)
+              }
+            } else if (failedRanges.has(rangeKey)) {
+              cachedNonShrinking = true
+            }
+          }
+        }
+      }
+
       if (!compacted) {
         if (nonShrinking !== undefined || cachedNonShrinking) {
           throw new Error('compaction cannot find a shrinking balanced range', {
@@ -400,6 +429,7 @@ export class BasicCompactionEngine extends CompactionEngine {
     end: number,
     agent: Agent,
     signal?: AbortSignal,
+    allowClosedStepOrphans = false,
   ): Promise<CompactionResult> {
     return compactSurfaceRegion(
       this.regionDependencies(),
@@ -407,7 +437,11 @@ export class BasicCompactionEngine extends CompactionEngine {
       start,
       end,
       agent,
-      { owner: 'current-turn', stability: 'whole-surface' },
+      {
+        owner: 'current-turn',
+        stability: 'whole-surface',
+        ...(allowClosedStepOrphans ? { allowClosedStepOrphans: true } : {}),
+      },
       signal,
     )
   }
