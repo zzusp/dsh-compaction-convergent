@@ -46,7 +46,7 @@
 ## 当前检查点
 
 - 当前子目标：SG11
-- 唯一下一步：提交并推送真实模型 repair 实现；是否用 repaired 输出替换生产 Session、启动 Resident 续聊仍需单独执行与验收。
+- 唯一下一步：等待用户决定是否用 repaired 输出替换生产 Session；若执行，再启动 Resident 验证同 ID 恢复与真实续聊。
 - 未闭环项：生产 Session 尚未替换；Web/Resident 已停止；health/API/UI 与真实消息续聊未验证。
 
 ## 进展
@@ -64,6 +64,7 @@
 - 2026-08-27：用户要求只安装、不启动。当前 PR artifact 已安装到 Resident，实际 import 回读 `0.1.1-rc.2-convergent.2 / Node v24.19.0`；安装/source `lib/region.js` SHA-256 同为 `76B6E6068E9BE40EBE43ACC6DD4A0F626CFBC1F1E5A86B9EE701CD5DAAFA3C34`，dump-config 保持官方 provider disabled、新 provider inserted。`3080/18998` 无监听，未声称运行态成功。
 - 2026-08-27：应用侧真实回合证明 Web provider 已接管并执行两次收敛尝试，但恢复时追加的 `session/end-seed` 将在线 surface 截为约 843 tokens，provider 看不到历史 880 nodes。Resident 已修正为切换 preset 不建 seed 副本、不换 Session ID，但不能绕过 DSH 恢复边界。撤回“问题 Session 已恢复”结论：确定性占位摘要只证明 replacement 事务，不能作为真实语义验证。
 - 2026-08-27：新增一次性 `repair` Cordis 入口，强制输入哈希、Session ID、独立输出与原子重载校验。真实 adapter 先后暴露 pressure 阈值漂移、代理开关和单次全量请求溢出；最终采用工具配对平衡的分层真实摘要，问题副本 131,393 → 13,527 tokens，880 nodes replacement，八段摘要齐全。原 Session 已恢复为 `AA97…`，Web 停止且 patch 恢复。
+- 2026-08-27：repair 实现提交 `3632207` 并推送 PR #3；GitHub Node 24 run `33067193298` 完成 130 tests、typecheck、build、pack，结论 SUCCESS。PR 正文已按真实模型证据更新并回读为 OPEN / MERGEABLE。
 
 ## 重大决策
 
