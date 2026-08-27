@@ -23,6 +23,7 @@
 - Node 24：typecheck、128/128 tests、coverage gate、build 通过。
 - 待发布包版本：`0.1.1-rc.2-convergent.2`。
 - `npm pack`：18 files、35,973 bytes；SHA-256 `1EEEDD6621D057AE03C416C507E330B2BABD7E0FF85F9915733E3F069264EEAF`，包内包含官方插件替换手册。
+- GitHub PR #3 首次 run `33062368121`：Node 24 quality and package SUCCESS，远端完成 typecheck、tests、build、pack 与 artifact 上传。
 
 ## 边界
 

@@ -45,8 +45,8 @@
 ## 当前检查点
 
 - 当前子目标：SG6
-- 唯一下一步：发布并安装本轮修复后，若用户授权启动 Resident/Web，则按 artifact、health、API、listener、UI、真实消息分别完成运行态验证。
-- 未闭环项：真实模型摘要质量尚未在该副本验证；本轮修复尚未合并发布和安装；Resident/Web 尚未启动；真实消息未验证。
+- 唯一下一步：等待并合并 PR #3；发布并安装 `convergent.2` 后，若用户授权启动 Resident/Web，则按 artifact、health、API、listener、UI、真实消息分别完成运行态验证。
+- 未闭环项：PR #3 尚未合并；真实模型摘要质量尚未在该副本验证；本轮修复尚未发布和安装；Resident/Web 尚未启动；真实消息未验证。
 
 ## 进展
 
@@ -59,6 +59,7 @@
 - 2026-08-27：PR #1 在 PR checks 全绿后合并为 `7e71e19f2b688cfc30e994036fbfbffe009dbf0c`；main run `33058350188` 与 tag run `33058483163` 均成功。Tag `v0.1.1-rc.2-convergent.1` 发布三个资产，下载 tgz 的 SHA-256 为 `23d348b18a8a2a95f253cb758fbd9dba460304a9256d537d717ae3613141ba5c`，与校验文件及 provenance 一致。
 - 2026-08-27：用户要求修复范围选择并用原问题 Session 的新副本验证；新增 SG10。已定位 `retainTokens=0` 仍先保留最新节点，使零预算无法覆盖整个最新闭合 surface，原先“历史 Session 本身无法收敛”的结论需由本轮实跑重新判定。
 - 2026-08-27：进一步反证发现最大范围仍只有 843 tokens；真实根因是 `seq 338` 两个已闭合步骤 `group_task_create` 调用从未落 result，造成其后所有官方计数边界永久不平衡。修复仅在最终摘要输入中临时闭合这类孤儿调用；问题 Session 新副本完成 replacement，131,393 → 11,926 tokens，持久化重载及后续消息追加通过，原 Session 哈希不变。
+- 2026-08-27：提交 `48e6398` 并创建 PR #3；远端 Node 24 run `33062368121` 完成 typecheck、128 tests、build、pack 与 artifact 上传，结论 SUCCESS。PR 回读为 OPEN / MERGEABLE。
 
 ## 重大决策
 
