@@ -17,6 +17,7 @@
       "@deepseek-ai/dsh-compaction-basic/src/*": ["./src/*"],
       "@zzusp/dsh-compaction-convergent": ["./src/index.ts"],
       "@zzusp/dsh-compaction-convergent/invariant": ["./src/invariant.ts"],
+      "@zzusp/dsh-compaction-convergent/repair": ["./src/repair.ts"],
       "@zzusp/dsh-compaction-convergent/src/*": ["./src/*"]
     },
     "types": ["node", "vitest/globals"]

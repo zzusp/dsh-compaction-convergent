@@ -1,13 +1,18 @@
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { Context } from '@deepseek-ai/cordis'
-import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import { BasicCompactionEngine } from '../../../../lib/index.js'
 
 const sessionPath = process.argv[2]
+const persist = process.argv[3] === '--persist'
+const acknowledgedPlaceholder = process.argv.includes('--acknowledge-placeholder-summary')
 if (sessionPath === undefined) {
-  throw new Error('Usage: node validate-session-copy.mjs <copied-session.jsonl>')
+  throw new Error('Usage: node validate-session-copy.mjs <copied-session.jsonl> [--persist] --acknowledge-placeholder-summary')
+}
+if (!acknowledgedPlaceholder) {
+  throw new Error('This script writes a placeholder summary and cannot preserve real Session semantics; pass --acknowledge-placeholder-summary only for transaction testing on a disposable copy.')
 }
 
 const lines = readFileSync(sessionPath, 'utf8').trimEnd().split(/\r?\n/)
@@ -66,29 +71,58 @@ const agent = {
 }
 const signal = new AbortController().signal
 const generation = session.surface.replaceGeneration
-const failures = []
+const totalTokensBefore = ctx.tokenMeter.measure(session).totalTokens
+const outcomes = []
 for (let attempt = 0; attempt < 2; attempt += 1) {
   try {
-    await compact.compactIfNeeded(agent, 'pressure', signal)
-    failures.push('unexpected success')
+    const compacted = await compact.compactIfNeeded(agent, 'pressure', signal)
+    outcomes.push(compacted === null ? null : {
+      shadowedTokenCount: compacted.shadowedTokenCount,
+      shadowedNodes: compacted.shadowedSeqs.length,
+    })
   } catch (error) {
-    failures.push(error instanceof Error ? error.message : String(error))
+    outcomes.push({ error: error instanceof Error ? error.message : String(error) })
   }
 }
+
+const totalTokensAfter = ctx.tokenMeter.measure(session).totalTokens
+if (persist) {
+  writeFileSync(sessionPath, [JSON.stringify(header), ...session.events.map(event => JSON.stringify(event)), ''].join('\n'))
+}
+const reloaded = Session.create(SessionId(`${header.id}-convergence-reload`), session.events)
+const reloadedTokens = ctx.tokenMeter.measure(reloaded).totalTokens
+reloaded.append('user/message', createUserMessage({
+  content: [{ type: 'text', text: 'post-compaction continuation probe' }],
+  source: { kind: 'plugin', plugin: 'dsh-compaction-convergent-validation' },
+}), { surfaceOp: 'append' })
+const continuation = reloaded.deriveMessages().at(-1)?.content
 
 const result = {
   sourceId: header.id,
   copiedPath: sessionPath,
-  totalTokens: ctx.tokenMeter.measure(session).totalTokens,
+  totalTokensBefore,
+  totalTokensAfter,
+  reloadedTokens,
   replaceGenerationBefore: generation,
   replaceGenerationAfter: session.surface.replaceGeneration,
   summarizerCallsAcrossTwoPressureChecks: compact.calls,
-  failures,
+  surfaceNodesAfter: session.surface.nodes.length,
+  persisted: persist,
+  semanticValidation: false,
+  continuation,
+  outcomes,
 }
 console.log(JSON.stringify(result, null, 2))
 
-if (compact.calls !== 1
-  || session.surface.replaceGeneration !== generation
-  || failures.some(message => message !== 'compaction cannot find a shrinking balanced range')) {
+if (compact.calls !== 2
+  || session.surface.replaceGeneration !== generation + 1
+  || totalTokensAfter >= totalTokensBefore
+  || reloadedTokens !== totalTokensAfter
+  || continuation?.[0]?.type !== 'text'
+  || continuation[0].text !== 'post-compaction continuation probe'
+  || outcomes[0] === null
+  || typeof outcomes[0] !== 'object'
+  || 'error' in outcomes[0]
+  || outcomes[1] !== null) {
   process.exitCode = 1
 }

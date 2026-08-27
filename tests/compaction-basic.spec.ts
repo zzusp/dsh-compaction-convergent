@@ -5,6 +5,7 @@ import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
 import type { BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic'
 import {
   selectCompactableRange,
+  selectMaximalCompactableRange,
   SummaryNotSmallerError,
 } from '@deepseek-ai/dsh-compaction-basic/src/region.ts'
 import type { SummarizationInput, SummaryResult } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts'
@@ -725,7 +726,7 @@ describe('pressure measurement and retention', () => {
     expect(session.events.filter(event => event.type === 'compaction/summary')).toHaveLength(1)
   })
 
-  it('does not pay the summarizer twice when expansion budgets select the same range', async () => {
+  it('tries each distinct retained and maximal range only once', async () => {
     const compact = service({
       auto: false,
       thresholdRatio: 0.5,
@@ -737,7 +738,7 @@ describe('pressure measurement and retention', () => {
 
     await expect(compactIfNeeded(compact, conversation(4)))
       .rejects.toThrow(/cannot find a shrinking balanced range/)
-    expect(compactRegion).toHaveBeenCalledTimes(1)
+    expect(compactRegion).toHaveBeenCalledTimes(2)
   })
 
   it('suppresses a failed range across pressure checks until the surface generation advances', async () => {
@@ -755,7 +756,7 @@ describe('pressure measurement and retention', () => {
       .rejects.toThrow(/cannot find a shrinking balanced range/)
     await expect(compactIfNeeded(compact, session))
       .rejects.toThrow(/cannot find a shrinking balanced range/)
-    expect(compactRegion).toHaveBeenCalledTimes(1)
+    expect(compactRegion).toHaveBeenCalledTimes(2)
 
     const tail = session.surface.nodes.at(-1)!
     session.append('user/message', createUserMessage({
@@ -767,7 +768,7 @@ describe('pressure measurement and retention', () => {
     })
     await expect(compactIfNeeded(compact, session))
       .rejects.toThrow(/cannot find a shrinking balanced range/)
-    expect(compactRegion).toHaveBeenCalledTimes(2)
+    expect(compactRegion).toHaveBeenCalledTimes(4)
   })
 
   it('bounds retries when a shrinking checkpoint remains above threshold', async () => {
@@ -816,6 +817,57 @@ describe('pressure measurement and retention', () => {
     }, 1)).toThrow(/does not match/)
   })
 
+  it('selects the whole latest balanced surface only for the maximal fallback', () => {
+    const ctx = createContext()
+    const session = conversation(2)
+    const priced = ctx.tokenMeter.measure(session)
+
+    expect(selectMaximalCompactableRange(session, priced)).toEqual({
+      start: session.surface.nodes[0],
+      end: session.surface.nodes.at(-1),
+    })
+  })
+
+  it('repairs closed-step orphan calls only inside maximal summarization input', async () => {
+    const ctx = createContext(10_000)
+    const compact = service({ auto: false }, ctx)
+    const session = Session.create(SessionId('closed-step-orphan'))
+    const callId = CallId('orphan-call')
+    session.append('turn/start', { turn: 1 })
+    session.append('step/start', { turn: 1, step: 1 })
+    session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: createMessage({
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'historical work '.repeat(500) },
+          { type: 'tool-call', id: callId, name: 'group_task_create', arguments: '{}' },
+        ],
+        source: { kind: 'model', provider: MODEL, model: MODEL },
+      }),
+    }, { surfaceOp: 'append' })
+    session.append('step/end', { turn: 1, step: 1 })
+
+    const nodes = [...session.surface.nodes]
+    expect(toolPairingBalancedAfter(session, nodes.at(-1)!)).toBe(false)
+    expect(selectMaximalCompactableRange(session, ctx.tokenMeter.measure(session))).toEqual({
+      start: nodes[0],
+      end: nodes.at(-1),
+    })
+
+    await expect(compact.compactRegion(
+      nodes[0]!,
+      nodes.at(-1)!,
+      agent(session, MODEL),
+      SIGNAL,
+      true,
+    )).resolves.toMatchObject({ shadowedSeqs: nodes })
+    expect(compact.calls[0]!.input.messages.some(message => message.content.some(block =>
+      block.type === 'tool-result' && block.toolCallId === callId))).toBe(true)
+    expect(session.events.some(event => event.type === 'tool/result')).toBe(false)
+  })
+
   it('declines when rounding a cut would consume the only tool pair', () => {
     const ctx = createContext()
     const session = Session.create(SessionId('one-tool-pair'))
@@ -848,6 +900,11 @@ describe('pressure measurement and retention', () => {
 
     const priced = ctx.tokenMeter.measure(session)
     expect(selectCompactableRange(session, priced, 1)).toBeNull()
+    expect(selectCompactableRange(session, priced, 0)).toBeNull()
+    expect(selectMaximalCompactableRange(session, priced)).toEqual({
+      start: session.surface.nodes[0],
+      end: session.surface.nodes.at(-1),
+    })
   })
 })
 

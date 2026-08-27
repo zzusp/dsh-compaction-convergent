@@ -10,7 +10,7 @@ import { CompactionEngine, ManualCompactionError } from '@deepseek-ai/dsh-compac
 import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import type { Session } from '@deepseek-ai/dsh-session'
-import { CONTEXT_WINDOW_EXCEEDED_CODE, assertNever } from '@deepseek-ai/dsh-llm'
+import { CONTEXT_WINDOW_EXCEEDED_CODE, assertNever, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
@@ -26,6 +26,7 @@ import {
   assertNoActiveCompaction,
   compactSurfaceRegion,
   selectCompactableRange,
+  selectMaximalCompactableRange,
   SummaryNotSmallerError,
 } from './region.ts'
 import { summarizeWithLlm } from './summarizer.ts'
@@ -136,6 +137,7 @@ export class BasicCompactionEngine extends CompactionEngine {
   private readonly warnedPressureConfigTargets = new Set<string>()
   private readonly overflowRetries = new WeakMap<Agent, number>()
   private readonly overflowAgents = new WeakMap<Session, Agent>()
+  private readonly historicalRepairSessions = new WeakSet<Session>()
 
   constructor(ctx: Context, config: BasicCompactionConfig = {}) {
     super(ctx)
@@ -256,7 +258,63 @@ export class BasicCompactionEngine extends CompactionEngine {
     const config = target === undefined
       ? this.config
       : resolveTargetPolicy(this.config, target)
+    if (this.historicalRepairSessions.has(agent.session)) {
+      return this.summarizeHistorical(input, agent, config, signal)
+    }
     return summarizeWithLlm(this.ctx, config, input, agent, signal)
+  }
+
+  /** Reduce an oversized historical surface through balanced chronological chunks. */
+  private async summarizeHistorical(
+    input: SummarizationInput,
+    agent: Agent,
+    config: ResolvedConfig | ReturnType<typeof resolveTargetPolicy>,
+    signal?: AbortSignal,
+  ): Promise<SummaryResult> {
+    const chunks: Array<typeof input.messages> = []
+    let chunk: typeof input.messages = []
+    let characters = 0
+    const pending = new Set<string>()
+    for (const message of input.messages) {
+      chunk = [...chunk, message]
+      characters += JSON.stringify(message).length
+      for (const block of message.content) {
+        if (block.type === 'tool-call') pending.add(block.id)
+        if (block.type === 'tool-result') pending.delete(block.toolCallId)
+      }
+      if (characters >= 180_000 && pending.size === 0) {
+        chunks.push(chunk)
+        chunk = []
+        characters = 0
+      }
+    }
+    if (chunk.length > 0) chunks.push(chunk)
+    if (chunks.length <= 1) return summarizeWithLlm(this.ctx, config, input, agent, signal)
+
+    let summaries: SummaryResult[] = []
+    for (const messages of chunks) {
+      summaries.push(await summarizeWithLlm(this.ctx, config, { messages }, agent, signal))
+    }
+    while (summaries.length > 1) {
+      const next: SummaryResult[] = []
+      for (let index = 0; index < summaries.length; index += 8) {
+        const group = summaries.slice(index, index + 8)
+        next.push(await summarizeWithLlm(this.ctx, config, {
+          messages: group.map((summary, part) => createUserMessage({
+            content: [{
+              type: 'text',
+              text: `Chronological partial checkpoint ${index + part + 1}:\n${summary.summary
+                .filter(block => block.type === 'text')
+                .map(block => block.text)
+                .join('\n')}`,
+            }],
+            source: { kind: 'plugin', plugin: 'dsh-compaction-convergent-repair' },
+          })),
+        }, agent, signal))
+      }
+      summaries = next
+    }
+    return summaries[0]!
   }
 
   /**
@@ -364,6 +422,34 @@ export class BasicCompactionEngine extends CompactionEngine {
         }
       }
 
+      if (!compacted && (nonShrinking !== undefined || cachedNonShrinking)) {
+        measurement = meter.measure(agent.session)
+        const range = selectMaximalCompactableRange(agent.session, measurement)
+        if (range !== null) {
+          const startIdx = measurement.nodes.findIndex(node => node.seq === range.start)
+          const endIdx = measurement.nodes.findIndex(node => node.seq === range.end)
+          const selectedTokens = measurement.nodes
+            .slice(startIdx, endIdx + 1)
+            .reduce((total, node) => total + node.tokens, 0)
+          if (measurement.totalTokens - selectedTokens < spec.thresholdTokens) {
+            const rangeKey = `${range.start}:${range.end}`
+            if (!attemptedRanges.has(rangeKey) && !failedRanges.has(rangeKey)) {
+              attemptedRanges.add(rangeKey)
+              try {
+                result = await this.compactRegion(range.start, range.end, agent, signal, true)
+                compacted = true
+              } catch (error: unknown) {
+                if (!(error instanceof SummaryNotSmallerError)) throw error
+                nonShrinking = error
+                failedRanges.add(rangeKey)
+              }
+            } else if (failedRanges.has(rangeKey)) {
+              cachedNonShrinking = true
+            }
+          }
+        }
+      }
+
       if (!compacted) {
         if (nonShrinking !== undefined || cachedNonShrinking) {
           throw new Error('compaction cannot find a shrinking balanced range', {
@@ -400,6 +486,7 @@ export class BasicCompactionEngine extends CompactionEngine {
     end: number,
     agent: Agent,
     signal?: AbortSignal,
+    allowClosedStepOrphans = false,
   ): Promise<CompactionResult> {
     return compactSurfaceRegion(
       this.regionDependencies(),
@@ -407,9 +494,40 @@ export class BasicCompactionEngine extends CompactionEngine {
       start,
       end,
       agent,
-      { owner: 'current-turn', stability: 'whole-surface' },
+      {
+        owner: 'current-turn',
+        stability: 'whole-surface',
+        ...(allowClosedStepOrphans ? { allowClosedStepOrphans: true } : {}),
+      },
       signal,
     )
+  }
+
+  /**
+   * Force the largest valid historical surface range for an explicit offline
+   * repair. This bypasses only automatic pressure policy; the normal summary,
+   * shrink, stability, transaction, and closed-step orphan checks still apply.
+   * @param agent - detached pre-recovery Session and its durable route.
+   * @param signal - cancellation forwarded to the real summarization provider.
+   * @returns the committed maximal-range replacement, or `null` for an empty surface.
+   */
+  async compactHistoricalSurface(
+    agent: Agent,
+    signal: AbortSignal,
+  ): Promise<CompactionResult | null> {
+    signal.throwIfAborted()
+    assertNoActiveCompaction(agent.session, 'historical Session repair')
+    const range = selectMaximalCompactableRange(
+      agent.session,
+      this.ctx.tokenMeter.measure(agent.session),
+    )
+    if (range === null) return null
+    this.historicalRepairSessions.add(agent.session)
+    try {
+      return await this.compactRegion(range.start, range.end, agent, signal, true)
+    } finally {
+      this.historicalRepairSessions.delete(agent.session)
+    }
   }
 
   /**

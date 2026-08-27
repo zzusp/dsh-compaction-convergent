@@ -3,7 +3,8 @@ import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
-import { selectCompactableRange } from '../../../../lib/region.js'
+import { toolPairingBalancedAfter, toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
+import { selectCompactableRange, selectMaximalCompactableRange } from '../../../../lib/region.js'
 
 const sessionPath = process.argv[2]
 const retainTokens = Number(process.argv[3])
@@ -23,7 +24,9 @@ const budgets = [...new Set([retainTokens, Math.floor(retainTokens / 2), 0])]
 const ranges = budgets.map((budget) => {
   const range = selectCompactableRange(session, measurement, budget)
   if (range === null) return { budget, range: null }
-  const selected = measurement.nodes.filter(node => node.seq >= range.start && node.seq <= range.end)
+  const startIdx = measurement.nodes.findIndex(node => node.seq === range.start)
+  const endIdx = measurement.nodes.findIndex(node => node.seq === range.end)
+  const selected = measurement.nodes.slice(startIdx, endIdx + 1)
   return {
     budget,
     range,
@@ -31,6 +34,36 @@ const ranges = budgets.map((budget) => {
     tokens: selected.reduce((total, node) => total + node.tokens, 0),
   }
 })
+const maximalRange = selectMaximalCompactableRange(session, measurement)
+const maximalNodes = maximalRange === null
+  ? []
+  : measurement.nodes.slice(
+      measurement.nodes.findIndex(node => node.seq === maximalRange.start),
+      measurement.nodes.findIndex(node => node.seq === maximalRange.end) + 1,
+    )
+let pairingBalance = 0
+let lastBalancedSurfaceSeq = null
+let assistantToolCalls = 0
+let toolResultEvents = 0
+const unmatchedCalls = []
+for (const seq of session.surface.nodes) {
+  const event = session.events[seq]
+  if (event.type === 'assistant/message') {
+    const calls = event.data.message.content.filter(block => block.type === 'tool-call').length
+    for (const block of event.data.message.content) {
+      if (block.type === 'tool-call') unmatchedCalls.push({ seq, id: block.id, name: block.name })
+    }
+    assistantToolCalls += calls
+    pairingBalance += calls
+  } else if (event.type === 'tool/result') {
+    toolResultEvents += 1
+    pairingBalance -= 1
+    const resultBlock = event.data.message.content.find(block => block.type === 'tool-result')
+    const matchedIndex = unmatchedCalls.findIndex(call => call.id === resultBlock?.toolCallId)
+    if (matchedIndex >= 0) unmatchedCalls.splice(matchedIndex, 1)
+  }
+  if (pairingBalance === 0) lastBalancedSurfaceSeq = seq
+}
 
 console.log(JSON.stringify({
   sourceId: header.id,
@@ -40,5 +73,19 @@ console.log(JSON.stringify({
   totalTokens: measurement.totalTokens,
   surfaceTokens: measurement.nodes.reduce((total, node) => total + node.tokens, 0),
   target: session.requestHeader()?.config,
+  firstBoundaryBalanced: toolPairingBalancedBefore(session, session.surface.nodes[0]),
+  lastBoundaryBalanced: toolPairingBalancedAfter(session, session.surface.nodes.at(-1)),
+  pairing: {
+    assistantToolCalls,
+    toolResultEvents,
+    finalBalance: pairingBalance,
+    lastBalancedSurfaceSeq,
+    unmatchedCalls,
+  },
   ranges,
+  maximalRange: maximalRange === null ? null : {
+    range: maximalRange,
+    nodes: maximalNodes.length,
+    tokens: maximalNodes.reduce((total, node) => total + node.tokens, 0),
+  },
 }, null, 2))

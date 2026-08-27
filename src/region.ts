@@ -16,7 +16,7 @@ import {
 } from '@deepseek-ai/dsh-compaction'
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
-import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
 import type { Message, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { TokenMeasurement, TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
@@ -59,6 +59,8 @@ interface CompactionTransactionOptions {
   readonly flush?: () => Promise<void>
   /** Manual command that initiated this transaction, when present. */
   readonly sourceCommandId?: CommandId
+  /** Permit terminal calls from durably closed steps to be summarized with synthetic error results. */
+  readonly allowClosedStepOrphans?: boolean
 }
 
 interface CompactionEntryState {
@@ -151,6 +153,60 @@ export function selectCompactableRange(
   return { start: first, end: cutoff }
 }
 
+/** Resolve the largest head-anchored range ending at the newest balanced boundary. */
+export function selectMaximalCompactableRange(
+  session: Session,
+  measurement: TokenMeasurement,
+): { start: number; end: number } | null {
+  const pricedNodes = measurement.nodes
+  if (pricedNodes.length === 0) return null
+
+  const surfaceNodes = session.surface.nodes
+  if (surfaceNodes.length !== pricedNodes.length
+    || surfaceNodes.some((seq, index) => seq !== pricedNodes[index]?.seq)) {
+    throw new Error('compaction: token-meter surface does not match the current session surface')
+  }
+
+  const first = surfaceNodes[0]!
+  if (!toolPairingBalancedBefore(session, first)) return null
+  if (hasOnlyClosedStepOrphans(session)) return { start: first, end: surfaceNodes.at(-1)! }
+  for (let endIdx = surfaceNodes.length - 1; endIdx >= 0; endIdx -= 1) {
+    const end = surfaceNodes[endIdx]!
+    if (toolPairingBalancedAfter(session, end)) return { start: first, end }
+  }
+  return null
+}
+
+/** Return terminal tool calls that cannot receive a result because their owning step is closed. */
+function closedStepOrphanIds(session: Session): Set<string> | null {
+  const pending = new Map<string, SessionEvent<'assistant/message'>>()
+  const closedSteps = new Map<string, number>()
+  for (const event of session.events) {
+    if (event.type === 'step/end') closedSteps.set(`${event.data.turn}:${event.data.step}`, event.seq)
+  }
+  for (const seq of session.surface.nodes) {
+    const event = session.events[seq]!
+    if (event.type === 'assistant/message') {
+      for (const block of event.data.message.content) {
+        if (block.type === 'tool-call') pending.set(block.id, event)
+      }
+    } else if (event.type === 'tool/result') {
+      const result = event.data.message.content.find(block => block.type === 'tool-result')
+      if (result !== undefined) pending.delete(result.toolCallId)
+    }
+  }
+  for (const event of pending.values()) {
+    const closedSeq = closedSteps.get(`${event.data.turn}:${event.data.step}`)
+    if (closedSeq === undefined || closedSeq <= event.seq) return null
+  }
+  return new Set(pending.keys())
+}
+
+function hasOnlyClosedStepOrphans(session: Session): boolean {
+  const orphans = closedStepOrphanIds(session)
+  return orphans !== null && orphans.size > 0
+}
+
 /**
  * Run the single compaction transaction over one selected positional span.
  * Selection and validation are read-only. Idle/log validation and
@@ -177,7 +233,7 @@ export async function compactSurfaceRegion(
   signal?: AbortSignal,
 ): Promise<CompactionResult> {
   if (options.owner === null) signal?.throwIfAborted()
-  const selection = validateSurfaceRegion(session, start, end)
+  const selection = validateSurfaceRegion(session, start, end, options.allowClosedStepOrphans === true)
   const entryState = inspectCompactionEntryState(session.events)
   assertCompactionInactive(
     entryState.unmatchedCompactionStart,
@@ -216,7 +272,12 @@ export async function compactSurfaceRegion(
   let stage: TransactionFailure['stage'] = 'summary'
 
   try {
-    const prepared = prepareCompaction(dependencies, session, selection)
+    const prepared = prepareCompaction(
+      dependencies,
+      session,
+      selection,
+      options.allowClosedStepOrphans === true,
+    )
     const summarized = await summarizeCompaction(
       dependencies,
       prepared,
@@ -330,7 +391,12 @@ export function assertNoActiveCompaction(session: Session, stage: string): void 
 }
 
 /** Validate one requested surface-position span before asynchronous work begins. */
-function validateSurfaceRegion(session: Session, start: number, end: number): SurfaceSelection {
+function validateSurfaceRegion(
+  session: Session,
+  start: number,
+  end: number,
+  allowClosedStepOrphans = false,
+): SurfaceSelection {
   const nodes = session.surface.nodes
   const startIdx = nodes.indexOf(start)
   const endIdx = nodes.indexOf(end)
@@ -346,7 +412,8 @@ function validateSurfaceRegion(session: Session, start: number, end: number): Su
     throw new Error(`compactRegion: start seq ${start} is not a balanced boundary (would split a step's tool-call/result pair)`)
   }
   // oxlint-disable-next-line typescript/no-non-null-assertion
-  if (!toolPairingBalancedAfter(session, nodes[endIdx]!)) {
+  if (!toolPairingBalancedAfter(session, nodes[endIdx]!)
+    && !(allowClosedStepOrphans && endIdx === nodes.length - 1 && hasOnlyClosedStepOrphans(session))) {
     throw new Error(`compactRegion: end seq ${end} is not a balanced boundary (would split a step, or the step is still open)`)
   }
 
@@ -358,6 +425,7 @@ function prepareCompaction(
   dependencies: RegionDependencies,
   session: Session,
   selection: SurfaceSelection,
+  repairClosedStepOrphans = false,
 ): PreparedCompaction {
   const measurement = dependencies.meter.measure(session)
   const selectedNodes = measurement.nodes.slice(selection.startIdx, selection.endIdx + 1)
@@ -370,7 +438,7 @@ function prepareCompaction(
     measurement,
     selectedNodes,
     shadowedTokenCount: selectedNodes.reduce((total, node) => total + node.tokens, 0),
-    input: buildSummarizationInput(session, selection.shadowedSeqs),
+    input: buildSummarizationInput(session, selection.shadowedSeqs, repairClosedStepOrphans),
   }
 }
 
@@ -517,14 +585,29 @@ function completeCompaction(
 function buildSummarizationInput(
   session: Session,
   shadowedSeqs: readonly number[],
+  repairClosedStepOrphans = false,
 ): SummarizationInput {
   const header = session.requestHeader()
   const events = session.events
+  const orphanIds = repairClosedStepOrphans ? closedStepOrphanIds(session) : null
   const regionMessages = shadowedSeqs
     // shadowedSeqs are current surface seqs, so each is a valid log index.
     // oxlint-disable-next-line typescript/no-non-null-assertion
-    .map(seq => session.deriveEventMessage(events[seq]!))
-    .filter((message): message is Message => message !== null)
+    .flatMap((seq): Message[] => {
+      const event = events[seq]!
+      const message = session.deriveEventMessage(event)
+      if (message === null) return []
+      if (event.type !== 'assistant/message' || orphanIds === null) return [message]
+      const repairs = event.data.message.content.flatMap(block => {
+        if (block.type !== 'tool-call' || !orphanIds.has(block.id)) return []
+        return [createToolResultMessage({
+          callId: block.id,
+          content: [{ type: 'text', text: 'Tool call ended without a persisted result in the historical session.' }],
+          isError: true,
+        })]
+      })
+      return [message, ...repairs]
+    })
   return {
     ...header?.system === undefined ? {} : { system: header.system },
     ...header?.tools === undefined ? {} : { tools: header.tools },
