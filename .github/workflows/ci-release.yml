@@ -1,0 +1,94 @@
+name: CI and Release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Node 24 quality and package
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test with coverage
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw -LiteralPath package.json | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "tag $env:GITHUB_REF_NAME must equal package version v$version"
+          }
+
+      - name: Pack and record provenance
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          npm pack --pack-destination dist
+          $package = Get-ChildItem -LiteralPath dist -Filter '*.tgz' | Select-Object -First 1
+          $hash = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($package.Name)" | Set-Content -LiteralPath "dist/$($package.Name).sha256" -Encoding utf8NoBOM
+          [ordered]@{
+            repository = $env:GITHUB_REPOSITORY
+            commit = $env:GITHUB_SHA
+            ref = $env:GITHUB_REF
+            package = $package.Name
+            sha256 = $hash
+          } | ConvertTo-Json | Set-Content -LiteralPath 'dist/provenance.json' -Encoding utf8NoBOM
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release assets
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: package-${{ github.sha }}
+          path: dist
+
+      - name: Create immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --verify-tag
+          --generate-notes
+          --title "$GITHUB_REF_NAME"

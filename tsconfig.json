@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "lib": ["ES2024"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "ignoreDeprecations": "6.0",
+    "baseUrl": ".",
+    "paths": {
+      "@deepseek-ai/dsh-compaction-basic": ["./src/index.ts"],
+      "@deepseek-ai/dsh-compaction-basic/invariant": ["./src/invariant.ts"],
+      "@deepseek-ai/dsh-compaction-basic/src/*": ["./src/*"],
+      "@zzusp/dsh-compaction-convergent": ["./src/index.ts"],
+      "@zzusp/dsh-compaction-convergent/invariant": ["./src/invariant.ts"],
+      "@zzusp/dsh-compaction-convergent/src/*": ["./src/*"]
+    },
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src", "tests", "vitest.config.ts"]
+}
