@@ -40,13 +40,14 @@
 | SG7 | Git/PR 收口 | 本地实跑、提交、推送、PR URL/state 回读完整 | 完成 | 公共仓库与 PR #1 已创建并回读 |
 | SG8 | GitHub 自动构建与版本产物 | PR/main 自动测试构建；合并后 tag 触发 Release 并附带可回读 `.tgz` | 完成 | PR/main/tag 三次 Actions 全绿；Release tgz 哈希与 provenance 回读通过 |
 | SG9 | 官方插件替换手册 | Release 下载、profile 安装、Cordis provider 替换、验证和回滚步骤可直接执行 | 完成 | `docs/manual/replace-official-plugin.md`；关键 patch 与实际 Resident dump-config 一致 |
-| SG10 | 已闭合步骤孤儿调用最大范围 | 普通边界不放宽；closed-step orphan 仅在最终摘要输入中临时配对，并在问题 Session 新副本上观察 replacement、token 下降、可重载与续接 | 完成 | `round-5.md`：131,393 → 11,926 tokens，880 → 1 nodes，重载与追加通过 |
+| SG10 | 已闭合步骤孤儿调用最大范围 | 普通边界不放宽；closed-step orphan 仅在最终摘要输入中临时配对；真实模型必须在 Web 恢复追加 end-seed 前完成语义保真 replacement | 进行中 | 确定性占位摘要仅证明事务；在线恢复后只能看到 843-token 新 surface，真实 Session 未压缩 |
+| SG11 | 恢复前真实模型一次性 repair | 提供显式入口，在 Web 恢复前读取完整历史 surface、调用真实模型、原子持久化标准 replacement，并由 Web 继续恢复同一 Session ID | 待实现 | 应用侧现场结论：需要 pre-recovery repair/compact 入口 |
 
 ## 当前检查点
 
-- 当前子目标：SG6
-- 唯一下一步：等待并合并 PR #3；若用户后续明确要求启动 Resident/Web，再按 health、API、listener、UI、真实消息分别完成运行态验证。
-- 未闭环项：PR #3 尚未合并和正式发布；真实模型摘要质量尚未在该副本验证；按用户当前范围 Resident/Web 不启动，真实消息未验证。
+- 当前子目标：SG11
+- 唯一下一步：设计并实现一次性、真实模型、Web 恢复前的 Session repair/compact 入口，再对问题 Session 副本执行语义保真验证。
+- 未闭环项：PR #3 的最大范围修复不能跨越恢复后的 `session/end-seed`；占位摘要会丢失语义；真实 Session 尚未压缩；Web 已停止，真实消息未验证。
 
 ## 进展
 
@@ -61,6 +62,7 @@
 - 2026-08-27：进一步反证发现最大范围仍只有 843 tokens；真实根因是 `seq 338` 两个已闭合步骤 `group_task_create` 调用从未落 result，造成其后所有官方计数边界永久不平衡。修复仅在最终摘要输入中临时闭合这类孤儿调用；问题 Session 新副本完成 replacement，131,393 → 11,926 tokens，持久化重载及后续消息追加通过，原 Session 哈希不变。
 - 2026-08-27：提交 `48e6398` 并创建 PR #3；远端 Node 24 run `33062368121` 完成 typecheck、128 tests、build、pack 与 artifact 上传，结论 SUCCESS。PR 回读为 OPEN / MERGEABLE。
 - 2026-08-27：用户要求只安装、不启动。当前 PR artifact 已安装到 Resident，实际 import 回读 `0.1.1-rc.2-convergent.2 / Node v24.19.0`；安装/source `lib/region.js` SHA-256 同为 `76B6E6068E9BE40EBE43ACC6DD4A0F626CFBC1F1E5A86B9EE701CD5DAAFA3C34`，dump-config 保持官方 provider disabled、新 provider inserted。`3080/18998` 无监听，未声称运行态成功。
+- 2026-08-27：应用侧真实回合证明 Web provider 已接管并执行两次收敛尝试，但恢复时追加的 `session/end-seed` 将在线 surface 截为约 843 tokens，provider 看不到历史 880 nodes。Resident 已修正为切换 preset 不建 seed 副本、不换 Session ID，但不能绕过 DSH 恢复边界。撤回“问题 Session 已恢复”结论：确定性占位摘要只证明 replacement 事务，不能作为真实语义验证。
 
 ## 重大决策
 

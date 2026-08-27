@@ -7,8 +7,12 @@ import { BasicCompactionEngine } from '../../../../lib/index.js'
 
 const sessionPath = process.argv[2]
 const persist = process.argv[3] === '--persist'
+const acknowledgedPlaceholder = process.argv.includes('--acknowledge-placeholder-summary')
 if (sessionPath === undefined) {
-  throw new Error('Usage: node validate-session-copy.mjs <copied-session.jsonl>')
+  throw new Error('Usage: node validate-session-copy.mjs <copied-session.jsonl> [--persist] --acknowledge-placeholder-summary')
+}
+if (!acknowledgedPlaceholder) {
+  throw new Error('This script writes a placeholder summary and cannot preserve real Session semantics; pass --acknowledge-placeholder-summary only for transaction testing on a disposable copy.')
 }
 
 const lines = readFileSync(sessionPath, 'utf8').trimEnd().split(/\r?\n/)
@@ -104,6 +108,7 @@ const result = {
   summarizerCallsAcrossTwoPressureChecks: compact.calls,
   surfaceNodesAfter: session.surface.nodes.length,
   persisted: persist,
+  semanticValidation: false,
   continuation,
   outcomes,
 }

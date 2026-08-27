@@ -16,7 +16,7 @@ package-dry-run-contents,PASS,PASS,PASS,PASS,PASS
 isolated-package-install,PASS,PASS,PASS,PASS,PASS
 real-session-copy-identical,PASS,PASS,PASS,PASS,PASS
 real-session-copy-repeat-cost-suppression,PASS,PASS,PASS,PASS,PASS
-real-session-copy-new-replacement,FAIL,FAIL,FAIL,FAIL,PASS
+real-session-copy-new-replacement,FAIL,FAIL,FAIL,FAIL,FAIL
 resident-profile-install,FAIL,PASS,PASS,PASS,PASS
 web-health-api-listener-ui,FAIL,FAIL,FAIL,FAIL,FAIL
 resident-real-message-readback,FAIL,FAIL,FAIL,FAIL,FAIL
@@ -24,4 +24,7 @@ github-pr-main-ci,PASS,PASS,PASS,PASS,PASS
 github-tag-release-assets,FAIL,FAIL,FAIL,PASS,PASS
 release-sha256-provenance,FAIL,FAIL,FAIL,PASS,PASS
 closed-step-orphan-maximal-range,FAIL,FAIL,FAIL,FAIL,PASS
-real-session-copy-reload-and-continue,FAIL,FAIL,FAIL,FAIL,PASS
+real-session-copy-reload-and-continue,FAIL,FAIL,FAIL,FAIL,FAIL
+placeholder-summary-transaction-only,FAIL,FAIL,FAIL,FAIL,PASS
+web-provider-takeover-real-turn,FAIL,FAIL,FAIL,FAIL,PASS
+pre-recovery-real-model-repair,FAIL,FAIL,FAIL,FAIL,FAIL
