@@ -21,3 +21,14 @@
 - 正常工具配对、overflow 尾部保留和重复范围熔断回归不变。
 - 闭合步骤孤儿调用可以进入最大范围，摘要输入配对完整，原日志不新增 tool result。
 - 问题 Session 新副本产生 replacement、token 下降、持久化后可重载并可追加下一条消息。
+
+## 恢复前一次性 repair
+
+Web 恢复历史 Session 会先追加 `session/end-seed`，因此在线 provider 不能承担病理历史的首次修复。包额外导出 `@zzusp/dsh-compaction-convergent/repair`，只用于 Resident 禁用时的一次性启动：
+
+1. 输入、输出与报告路径必须不同，输出必须与输入同目录且尚不存在。
+2. 调用前同时校验输入 SHA-256 与 Session ID；输入始终只读。
+3. 显式选择最大历史 surface，不依赖自动 pressure 阈值。
+4. 单次请求若超过模型窗口，将消息按工具配对平衡边界切成约 180,000 字符的时间顺序分块，先生成真实模型局部摘要，再递归合并为一个标准八段 checkpoint。
+5. 最终仍通过官方兼容的 `compaction/start → summary → replace → compaction/end` 事务提交；摘要不缩小或 surface 改变仍会失败。
+6. 仅在 replacement、token 下降和持久化重载都成功后，才原子创建输出与不含摘要正文的报告。

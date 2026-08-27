@@ -94,3 +94,16 @@ Pop-Location
 ```
 
 确认 `dump-config` 只启用官方 provider 后再启动。回滚不修改 Session 日志格式或既有 checkpoint。
+
+## 6. 历史 Session 一次性修复
+
+若历史 Session 已大到 Web 恢复后只能看到 `session/end-seed` 之后的新 surface，不要对原文件运行占位摘要脚本。使用 `@zzusp/dsh-compaction-convergent/repair` 时必须：
+
+- 先停止 Web，并复制原 `session.jsonl`；
+- 在临时 patch 中禁用会恢复历史 Session 的 Resident；
+- 配置互不相同的 `inputPath`、`outputPath`、`reportPath`，以及复制文件的 `expectedSha256`、`expectedSessionId`；
+- 使用 Node 24 启动一次 Web，让现有 profile 的真实 LLM adapter 完成分层摘要；
+- 仅在报告的 `semanticValidation=true`、token 下降、generation 前进且输出可重载后，才考虑用输出替换目标 Session；
+- 完成后删除 repair entry、恢复 Resident 配置并停止临时 Web。
+
+repair 永不覆盖输入或既有输出。真实模型、网络、上下文窗口、摘要变小或重载校验任一失败时，不会生成修复输出。

@@ -2,7 +2,7 @@
 
 > 状态：ACTIVE  
 > Goal ID：dsh-compaction-convergence  
-> 最近维护：2026-08-27T17:29:00+08:00
+> 最近维护：2026-08-27T19:20:00+08:00
 > 权威目标：D:\project\dsh-compaction-convergent\docs\acceptance\compaction-convergence\goal.md
 
 ## 总目标
@@ -40,14 +40,14 @@
 | SG7 | Git/PR 收口 | 本地实跑、提交、推送、PR URL/state 回读完整 | 完成 | 公共仓库与 PR #1 已创建并回读 |
 | SG8 | GitHub 自动构建与版本产物 | PR/main 自动测试构建；合并后 tag 触发 Release 并附带可回读 `.tgz` | 完成 | PR/main/tag 三次 Actions 全绿；Release tgz 哈希与 provenance 回读通过 |
 | SG9 | 官方插件替换手册 | Release 下载、profile 安装、Cordis provider 替换、验证和回滚步骤可直接执行 | 完成 | `docs/manual/replace-official-plugin.md`；关键 patch 与实际 Resident dump-config 一致 |
-| SG10 | 已闭合步骤孤儿调用最大范围 | 普通边界不放宽；closed-step orphan 仅在最终摘要输入中临时配对；真实模型必须在 Web 恢复追加 end-seed 前完成语义保真 replacement | 进行中 | 确定性占位摘要仅证明事务；在线恢复后只能看到 843-token 新 surface，真实 Session 未压缩 |
-| SG11 | 恢复前真实模型一次性 repair | 提供显式入口，在 Web 恢复前读取完整历史 surface、调用真实模型、原子持久化标准 replacement，并由 Web 继续恢复同一 Session ID | 待实现 | 应用侧现场结论：需要 pre-recovery repair/compact 入口 |
+| SG10 | 已闭合步骤孤儿调用最大范围 | 普通边界不放宽；closed-step orphan 仅在最终摘要输入中临时配对；真实模型必须在 Web 恢复追加 end-seed 前完成语义保真 replacement | 完成 | `round-6.md`：真实模型覆盖 880 nodes，131,393 → 13,527 tokens |
+| SG11 | 恢复前真实模型一次性 repair | 提供显式入口，在 Web 恢复前读取完整历史 surface、调用真实模型、原子持久化标准 replacement，并由 Web 继续恢复同一 Session ID | 进行中 | repair 入口、真实模型、原子输出与重载已通过；尚未让 Resident 从 repaired 输出恢复并续聊 |
 
 ## 当前检查点
 
 - 当前子目标：SG11
-- 唯一下一步：设计并实现一次性、真实模型、Web 恢复前的 Session repair/compact 入口，再对问题 Session 副本执行语义保真验证。
-- 未闭环项：PR #3 的最大范围修复不能跨越恢复后的 `session/end-seed`；占位摘要会丢失语义；真实 Session 尚未压缩；Web 已停止，真实消息未验证。
+- 唯一下一步：提交并推送真实模型 repair 实现；是否用 repaired 输出替换生产 Session、启动 Resident 续聊仍需单独执行与验收。
+- 未闭环项：生产 Session 尚未替换；Web/Resident 已停止；health/API/UI 与真实消息续聊未验证。
 
 ## 进展
 
@@ -63,6 +63,7 @@
 - 2026-08-27：提交 `48e6398` 并创建 PR #3；远端 Node 24 run `33062368121` 完成 typecheck、128 tests、build、pack 与 artifact 上传，结论 SUCCESS。PR 回读为 OPEN / MERGEABLE。
 - 2026-08-27：用户要求只安装、不启动。当前 PR artifact 已安装到 Resident，实际 import 回读 `0.1.1-rc.2-convergent.2 / Node v24.19.0`；安装/source `lib/region.js` SHA-256 同为 `76B6E6068E9BE40EBE43ACC6DD4A0F626CFBC1F1E5A86B9EE701CD5DAAFA3C34`，dump-config 保持官方 provider disabled、新 provider inserted。`3080/18998` 无监听，未声称运行态成功。
 - 2026-08-27：应用侧真实回合证明 Web provider 已接管并执行两次收敛尝试，但恢复时追加的 `session/end-seed` 将在线 surface 截为约 843 tokens，provider 看不到历史 880 nodes。Resident 已修正为切换 preset 不建 seed 副本、不换 Session ID，但不能绕过 DSH 恢复边界。撤回“问题 Session 已恢复”结论：确定性占位摘要只证明 replacement 事务，不能作为真实语义验证。
+- 2026-08-27：新增一次性 `repair` Cordis 入口，强制输入哈希、Session ID、独立输出与原子重载校验。真实 adapter 先后暴露 pressure 阈值漂移、代理开关和单次全量请求溢出；最终采用工具配对平衡的分层真实摘要，问题副本 131,393 → 13,527 tokens，880 nodes replacement，八段摘要齐全。原 Session 已恢复为 `AA97…`，Web 停止且 patch 恢复。
 
 ## 重大决策
 
@@ -70,6 +71,7 @@
 - 第一版将扩张预算固定为 `[1, 0.5, 0]`，暂不公开新配置；减少配置面并直接覆盖已确认故障。
 - 失败范围缓存以 `Session` 弱引用保存，并用 `surface.replaceGeneration` 自动换代；既不跨 Session 泄漏，也不会在表层已前进后错误熔断新尝试。
 - 首次范围扩张和熔断继续保留；本轮不把 `retainTokens=0` 全局改成整面压缩，因为回归证明这会破坏 overflow 保留最新完整步骤。最大整面候选只在普通范围发生不缩小后启用，且仅容忍已有持久化 `step/end` 的孤儿调用。
+- 恢复前 repair 不复用自动 pressure 阈值；它显式选择最大历史 surface。单次真实请求超过窗口时按工具配对平衡边界分块摘要，再递归合并，最终只提交一次标准 replacement；输入永不覆盖。
 
 ## 重要信息
 

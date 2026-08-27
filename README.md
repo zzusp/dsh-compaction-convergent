@@ -167,6 +167,8 @@ The replayed system prompt, tools, and shadowed-region messages match the conver
 
 ## Known Limitations and Deferred Work
 
+- **Historical recovery boundaries require explicit repair** — Web appends `session/end-seed` while restoring a persisted Session. Repair pathological history before Resident recovery with the real-model, hierarchical `@zzusp/dsh-compaction-convergent/repair` entry. It verifies SHA-256 and Session ID and creates a new output without overwriting its input.
+
 - **Meter accuracy follows the fixed heuristic** — missing reusable provider usage falls back to character count plus structural overhead rather than exact tokenization.
 - **Overflow classification is adapter-maintained** — provider wording can change; both DeepSeek adapters normalize currently recognized context-limit failures to `CONTEXT_WINDOW_EXCEEDED`.
 - **Some indivisible-unit and envelope-only overflow remains outside surface compaction** — recovery cannot shrink system/tools/prefix, split an indivisible non-tool node, or repair a tool unit whose non-prunable remainder still exceeds the window. The optional pruner can shrink text-bearing tool-result bulk inside an otherwise indivisible pair.
