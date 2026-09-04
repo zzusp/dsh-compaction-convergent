@@ -8,7 +8,7 @@
 
 ## 构建与发布
 
-Pull Request 和 `main` push 会在 GitHub Actions 的 Windows Node 24 环境执行依赖锁定安装、类型检查、100% 覆盖率测试、构建和 `npm pack`，并上传与完整源码 SHA 绑定的 workflow artifact。推送与 `package.json` 版本严格一致的 `v<version>` tag 后，同一构建产物会发布到 GitHub Release，同时附带 SHA-256 和 `provenance.json`。
+仅推送与 `package.json` 版本严格一致的 `v<version>` tag 会触发 GitHub Actions。工作流会在 Windows Node 24 环境执行依赖锁定安装、类型检查、100% 覆盖率测试、构建和 `npm pack`，然后将与完整源码 SHA 绑定的产物发布到 GitHub Release，同时附带 SHA-256 和 `provenance.json`。Pull Request 和 `main` push 不会触发该工作流。
 
 完整替换步骤、验证与回滚方式见[《替换官方压缩插件》](docs/manual/replace-official-plugin.md)。
 
