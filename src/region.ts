@@ -16,13 +16,20 @@ import {
 } from '@deepseek-ai/dsh-compaction'
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
-import { createToolResultMessage, createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
+import {
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  createToolResultMessage,
+  createUserMessage,
+  errorChain,
+} from '@deepseek-ai/dsh-llm'
 import type { Message, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { TokenMeasurement, TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { frameSummary } from './summarizer.ts'
+import { frameSummary, SummaryInputTooLargeError } from './summarizer.ts'
 import type { SummarizationInput, SummaryResult } from './summarizer.ts'
+import { observeCapacity, startedRecord } from './convergence.ts'
+import type { CompactionConvergenceRecord, CompactionJobAttempt } from './convergence.ts'
 
 interface RegionDependencies {
   readonly meter: TokenMeter
@@ -55,6 +62,7 @@ interface PreparedCompaction extends SurfaceSelection {
 
 type SummarizedCompaction = PreparedCompaction & SummaryResult & {
   readonly checkpointMessage: UserMessage
+  readonly framedSummaryTokenCount: number
 }
 
 interface CompactionTransactionOptions {
@@ -68,6 +76,8 @@ interface CompactionTransactionOptions {
   readonly sourceCommandId?: CommandId
   /** Permit terminal calls from durably closed steps to be summarized with synthetic error results. */
   readonly allowClosedStepOrphans?: boolean
+  /** Automatic convergence-job diagnostics; absent for manual and historical entry points. */
+  readonly jobAttempt?: CompactionJobAttempt
 }
 
 interface CompactionEntryState {
@@ -327,7 +337,10 @@ export async function compactSurfaceRegion(
     ...options.sourceCommandId === undefined ? {} : { sourceCommandId: options.sourceCommandId },
     turn: owner,
   }
-  const startEvent = session.append('compaction/start', lifecycle)
+  const startData = options.jobAttempt === undefined
+    ? lifecycle
+    : { ...lifecycle, convergence: startedRecord(options.jobAttempt) }
+  const startEvent = session.append('compaction/start', startData)
   const assertStable: StabilityCheck = options.stability === 'whole-surface'
     ? assertWholeSurfaceUnchanged
     : assertSelectedSpanStable
@@ -356,7 +369,7 @@ export async function compactSurfaceRegion(
     if (options.owner === null) signal?.throwIfAborted()
     assertStable(dependencies, session, summarized)
     stage = 'commit'
-    const pending = commitCompactionBody(session, startEvent, summarized)
+    const pending = commitCompactionBody(session, startEvent, summarized, options.jobAttempt)
     closing = true
     const endEvent = session.append('compaction/end', lifecycle)
     closed = true
@@ -366,7 +379,15 @@ export async function compactSurfaceRegion(
     if (!closing) {
       closing = true
       try {
-        session.append('compaction/end', { ...lifecycle, error: errorChain(error) })
+        const convergence = options.jobAttempt === undefined
+          ? undefined
+          : failedConvergenceRecord(options.jobAttempt, error, signal)
+        const endData = {
+          ...lifecycle,
+          error: errorChain(error),
+          ...(convergence === undefined ? {} : { convergence }),
+        }
+        session.append('compaction/end', endData)
         closed = true
       } catch (closeError: unknown) {
         failure = { error: closeError, stage: 'commit' }
@@ -388,6 +409,11 @@ export async function compactSurfaceRegion(
     throw failure.error
   }
   if (flushFailure !== undefined) {
+    if (options.owner !== null) {
+      throw new Error('automatic compaction durability checkpoint failed', {
+        cause: flushFailure,
+      })
+    }
     throw new ManualCompactionError(
       'persistence',
       'manual compaction durability checkpoint failed',
@@ -534,6 +560,7 @@ async function summarizeCompaction(
     ...prepared,
     ...summaryResult,
     checkpointMessage,
+    framedSummaryTokenCount,
   }
 }
 
@@ -582,6 +609,7 @@ function commitCompactionBody(
   session: Session,
   startEvent: SessionEvent<'compaction/start'>,
   summarized: SummarizedCompaction,
+  jobAttempt: CompactionJobAttempt | undefined,
 ): Omit<CompactionResult, 'endSeq'> {
   const {
     start,
@@ -594,11 +622,24 @@ function commitCompactionBody(
     maxTokens,
     usage,
     checkpointMessage,
+    summaryEnvelope,
+    framedSummaryTokenCount,
   } = summarized
   const callProvenance = summarized.llmStreamCall === true
     ? { rawOutput: summarized.rawOutput, llmStreamCall: true as const }
     : summarized.rawOutput === undefined ? {} : { rawOutput: summarized.rawOutput }
-  const summaryEvent = session.append('compaction/summary', {
+  const convergence = jobAttempt === undefined
+    ? undefined
+    : succeededConvergenceRecord(
+      jobAttempt,
+      summarized.measurement.totalTokens - shadowedTokenCount + framedSummaryTokenCount,
+      summarized.measurement.surfaceTokens - shadowedTokenCount + framedSummaryTokenCount,
+      shadowedTokenCount,
+      framedSummaryTokenCount,
+      summaryEnvelope,
+      usage,
+    )
+  const summaryData = {
     compactionId: startEvent.data.compactionId,
     ...startEvent.data.sourceCommandId === undefined
       ? {}
@@ -612,7 +653,9 @@ function commitCompactionBody(
     model,
     ...maxTokens === undefined ? {} : { maxTokens },
     ...usage === undefined ? {} : { usage },
-  })
+    ...(convergence === undefined ? {} : { convergence }),
+  }
+  const summaryEvent = session.append('compaction/summary', summaryData)
   session.append('user/message', checkpointMessage, {
     surfaceOp: { op: 'replace', start, end },
     sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
@@ -628,6 +671,131 @@ function commitCompactionBody(
     shadowedRange: { start, end },
     shadowedSeqs: [...shadowedSeqs],
     shadowedTokenCount,
+  }
+}
+
+/** Complete metrics and capacity observations for one committed chunk. */
+function succeededConvergenceRecord(
+  attempt: CompactionJobAttempt,
+  requestTokensAfter: number,
+  surfaceTokensAfter: number,
+  shadowedTokens: number,
+  framedSummaryTokens: number,
+  envelope: SummaryResult['summaryEnvelope'],
+  usage: SummaryResult['usage'],
+): CompactionConvergenceRecord {
+  const willContinueJob = attempt.thresholdTokens !== undefined
+    && requestTokensAfter >= attempt.thresholdTokens
+  const capacity = envelope === undefined
+    ? attempt.capacity
+    : observeCapacity(attempt.capacity, envelope, 'accepted', Date.now())
+  return {
+    version: 1,
+    ...attempt,
+    ...(envelope === undefined ? {} : { capacityKey: envelope.capacityKey }),
+    ...(capacity === undefined ? {} : { capacity }),
+    outcome: 'succeeded',
+    willContinueJob,
+    state: attempt.thresholdTokens === undefined
+      ? 'one-shot'
+      : willContinueJob ? 'running' : 'completed',
+    requestTokensAfter,
+    surfaceTokensAfter,
+    shadowedTokens,
+    framedSummaryTokens,
+    ...(envelope === undefined ? {} : {
+      summaryEstimatedInputTokens: envelope.estimatedInputTokens,
+      summaryReservedOutputTokens: envelope.reservedOutputTokens,
+    }),
+    ...(usage === undefined ? {} : {
+      providerInputTokens: usage.inputTokens,
+      providerOutputTokens: usage.outputTokens,
+    }),
+    ...(attempt.thresholdTokens === undefined ? {} : {
+      remainingToThreshold: Math.max(0, requestTokensAfter - attempt.thresholdTokens),
+    }),
+  }
+}
+
+/** Classify a closed failed transaction without claiming surface progress. */
+function failedConvergenceRecord(
+  attempt: CompactionJobAttempt,
+  error: unknown,
+  signal: AbortSignal | undefined,
+): CompactionConvergenceRecord {
+  if (error instanceof SummaryInputTooLargeError) {
+    const capacity = observeCapacity(
+      attempt.capacity,
+      error.estimate,
+      'rejected',
+      Date.now(),
+    )
+    const replayBudget = error.providerRejected
+      ? error.providerReplayTokenLimit
+      : error.estimate.availableReplayTokens
+    const nextTokenBudget = replayBudget === undefined
+      ? Math.max(1, Math.floor(attempt.selectedSurfaceTokens / 2))
+      : error.estimate.replayMessageTokens === 0
+        ? 0
+        : Math.min(
+          attempt.selectedSurfaceTokens - 1,
+          Math.floor(
+            attempt.selectedSurfaceTokens
+            * replayBudget
+            / error.estimate.replayMessageTokens,
+          ),
+        )
+    return {
+      version: 1,
+      ...attempt,
+      capacityKey: error.estimate.capacityKey,
+      capacity,
+      outcome: 'failed',
+      willContinueJob: true,
+      state: 'running',
+      failureKind: 'input-too-large',
+      failureMessage: errorChain(error),
+      nextTokenBudget,
+    }
+  }
+  if (typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && error.code === CONTEXT_WINDOW_EXCEEDED_CODE) {
+    return {
+      version: 1,
+      ...attempt,
+      outcome: 'failed',
+      willContinueJob: true,
+      state: 'running',
+      failureKind: 'input-too-large',
+      failureMessage: errorChain(error),
+      nextTokenBudget: Math.max(1, Math.floor(attempt.selectedSurfaceTokens / 2)),
+    }
+  }
+  if (error instanceof SummaryNotSmallerError) {
+    return {
+      version: 1,
+      ...attempt,
+      outcome: 'failed',
+      willContinueJob: true,
+      state: 'running',
+      failureKind: 'non-shrinking',
+      failureMessage: errorChain(error),
+      nonShrinkingSummaryTokens: error.summaryTokens,
+      nonShrinkingShadowedTokens: error.shadowedTokens,
+    }
+  }
+  const cancelled = signal?.aborted === true
+    || (error instanceof Error && error.name === 'AbortError')
+  return {
+    version: 1,
+    ...attempt,
+    outcome: 'failed',
+    willContinueJob: false,
+    state: 'failed',
+    failureKind: cancelled ? 'cancelled' : 'unknown',
+    failureMessage: errorChain(error),
   }
 }
 

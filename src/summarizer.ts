@@ -4,6 +4,7 @@
  * @module @zzusp/dsh-compaction-convergent/summarizer
  */
 
+import { createHash } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   contentHasImage,
@@ -97,6 +98,8 @@ export type SummaryResult = {
   provider: string
   model: string
   maxTokens?: number
+  /** Complete estimated input envelope for the default local LLM summarizer. */
+  summaryEnvelope?: SummaryEnvelopeEstimate
   /** Provider-reported usage for this summarization request. */
   usage?: TokenUsage
 } & (
@@ -116,6 +119,8 @@ export type SummaryResult = {
 
 /** Complete request-budget facts for one default summarization call. */
 export interface SummaryEnvelopeEstimate {
+  /** Compatibility identity for learned replay capacity. */
+  readonly capacityKey: string
   readonly provider: string
   readonly model: string
   readonly contextWindow: number | undefined
@@ -127,8 +132,14 @@ export interface SummaryEnvelopeEstimate {
   readonly availableReplayTokens: number | undefined
 }
 
+/** Versioned description of the TokenMeter calls used to price this envelope. */
+const TOKEN_METER_STRATEGY = 'dsh-token-meter:measure+estimateMessage:v1'
+
 /** A summary range that cannot be submitted to its resolved model as one request. */
 export class SummaryInputTooLargeError extends LlmError {
+  /** Provider-derived replay ceiling when its message exposes actual and maximum token counts. */
+  readonly providerReplayTokenLimit: number | undefined
+
   constructor(
     readonly estimate: SummaryEnvelopeEstimate,
     readonly providerRejected: boolean,
@@ -148,7 +159,38 @@ export class SummaryInputTooLargeError extends LlmError {
       CONTEXT_WINDOW_EXCEEDED_CODE,
       options,
     )
+    this.providerReplayTokenLimit = providerRejected
+      ? replayLimitFromProviderError(options?.cause, estimate)
+      : undefined
   }
+}
+
+/** Convert a provider's actual-minus-maximum token gap into a replay ceiling. */
+function replayLimitFromProviderError(
+  cause: unknown,
+  estimate: SummaryEnvelopeEstimate,
+): number | undefined {
+  const message = cause instanceof Error ? cause.message : String(cause ?? '')
+  const maximum = tokenCountMatch(message, [
+    /maximum context (?:length|window)(?: is| of)?\s*([\d,]+)/i,
+    /context (?:length|window)(?: limit)?(?: is| of)?\s*([\d,]+)/i,
+  ])
+  const actual = tokenCountMatch(message, [
+    /messages resulted in\s*([\d,]+)/i,
+    /(?:request|input)(?: contains| has| is| of)?\s*([\d,]+)\s*tokens/i,
+  ])
+  if (maximum === undefined || actual === undefined || actual <= maximum) return undefined
+  return Math.max(0, estimate.replayMessageTokens - (actual - maximum))
+}
+
+function tokenCountMatch(message: string, patterns: readonly RegExp[]): number | undefined {
+  for (const pattern of patterns) {
+    const raw = pattern.exec(message)?.[1]
+    if (raw === undefined) continue
+    const value = Number(raw.replaceAll(',', ''))
+    if (Number.isSafeInteger(value) && value >= 0) return value
+  }
+  return undefined
 }
 
 /** Build the exact trailing instruction message shared by estimation and dispatch. */
@@ -182,7 +224,19 @@ function estimateSummaryEnvelope(
   )
   const instructionTokens = meter.estimateMessage(instruction)
   const estimatedInputTokens = fixedEnvelopeTokens + replayMessageTokens + instructionTokens
+  const fingerprint = createHash('sha256').update(JSON.stringify({
+    provider,
+    model,
+    contextWindow: contextWindow ?? null,
+    maxTokens,
+    fixedEnvelopeTokens,
+    instruction: COMPACTION_INSTRUCTION,
+    system: input.system ?? null,
+    tools: input.tools ?? null,
+    tokenMeterStrategy: TOKEN_METER_STRATEGY,
+  })).digest('hex')
   return {
+    capacityKey: `${provider}/${model}:${fingerprint}`,
     provider,
     model,
     contextWindow,
@@ -195,6 +249,34 @@ function estimateSummaryEnvelope(
       ? undefined
       : Math.max(0, contextWindow - fixedEnvelopeTokens - instructionTokens - maxTokens),
   }
+}
+
+/**
+ * Resolve and price one default summary envelope without dispatching it. The
+ * caller may pass an empty `messages` list when it only needs the compatibility
+ * key and fixed replay capacity before selecting a range.
+ */
+export async function estimateDefaultSummaryEnvelope(
+  ctx: Context,
+  meter: TokenMeter,
+  config: SummaryConfig,
+  input: SummarizationInput,
+  agent: Agent,
+  signal?: AbortSignal,
+): Promise<SummaryEnvelopeEstimate> {
+  const target = summaryTarget(config, agent)
+  const instruction = compactionInstructionMessage()
+  const modelInfo = await ctx.llm.resolveModelInfo(target.provider, target.model, signal)
+  return estimateSummaryEnvelope(
+    meter,
+    input,
+    agent,
+    target.provider,
+    target.model,
+    config.maxTokens,
+    instruction,
+    modelInfo.context?.contextWindow,
+  )
 }
 
 /**
@@ -217,22 +299,7 @@ export async function summarizeWithLlm(
   agent: Agent,
   signal?: AbortSignal,
 ): Promise<SummaryResult> {
-  const latest = agent.session.requestHeader()?.config
-  const configured = config.summarizationProvider.length === 0
-    ? undefined
-    : { provider: config.summarizationProvider, model: config.summarizationModel }
-  const agentTarget = agent.options.provider !== undefined
-    && agent.options.provider.length > 0
-    && agent.options.model !== undefined
-    && agent.options.model.length > 0
-    ? { provider: agent.options.provider, model: agent.options.model }
-    : undefined
-  const target = configured ?? latest ?? agentTarget
-  if (target === undefined) {
-    throw new Error(
-      'no provider/model available for summarization: set both BasicCompactionConfig summarization fields, route one request, or set both AgentOptions fields',
-    )
-  }
+  const target = summaryTarget(config, agent)
 
   const instruction = compactionInstructionMessage()
   const messages: Message[] = [
@@ -288,8 +355,33 @@ export async function summarizeWithLlm(
     provider: options.provider,
     model: options.model,
     maxTokens: config.maxTokens,
+    summaryEnvelope: estimate,
     ...(assembler.usage === undefined ? {} : { usage: assembler.usage }),
   }
+}
+
+/** Resolve the same summary route for estimation and dispatch. */
+function summaryTarget(
+  config: SummaryConfig,
+  agent: Agent,
+): { readonly provider: string; readonly model: string } {
+  const latest = agent.session.requestHeader()?.config
+  const configured = config.summarizationProvider.length === 0
+    ? undefined
+    : { provider: config.summarizationProvider, model: config.summarizationModel }
+  const agentTarget = agent.options.provider !== undefined
+    && agent.options.provider.length > 0
+    && agent.options.model !== undefined
+    && agent.options.model.length > 0
+    ? { provider: agent.options.provider, model: agent.options.model }
+    : undefined
+  const target = configured ?? latest ?? agentTarget
+  if (target === undefined) {
+    throw new Error(
+      'no provider/model available for summarization: set both BasicCompactionConfig summarization fields, route one request, or set both AgentOptions fields',
+    )
+  }
+  return target
 }
 
 /**

@@ -31,8 +31,25 @@ import {
   selectMaximalCompactableRange,
   SummaryNotSmallerError,
 } from './region.ts'
-import { summarizeWithLlm, SummaryInputTooLargeError } from './summarizer.ts'
-import type { SummarizationInput, SummaryResult } from './summarizer.ts'
+import {
+  estimateDefaultSummaryEnvelope,
+  summarizeWithLlm,
+  SummaryInputTooLargeError,
+} from './summarizer.ts'
+import type { SummarizationInput, SummaryEnvelopeEstimate, SummaryResult } from './summarizer.ts'
+import {
+  convergenceRecord,
+  currentJobFailureRecords,
+  learnedReplayBudget,
+  observeCapacity,
+  restoreConvergence,
+} from './convergence.ts'
+import type {
+  CompactionJob,
+  CompactionJobAttempt,
+  RestoredConvergence,
+  SummaryCapacityProfile,
+} from './convergence.ts'
 import type {
   BasicCompactionConfig,
   ModelCompactPolicyConfig,
@@ -49,9 +66,11 @@ export type {
   ResolvedTargetPolicy,
 } from './types.ts'
 export type { SummaryEnvelopeEstimate } from './summarizer.ts'
+export type { CompactionConvergenceRecord, SummaryCapacityProfile } from './convergence.ts'
 
 export { SummaryNotSmallerError } from './region.ts'
 export { SummaryInputTooLargeError } from './summarizer.ts'
+export { convergenceRecord } from './convergence.ts'
 
 type Range = { readonly start: number; readonly end: number }
 
@@ -63,6 +82,12 @@ type FailedRange =
     readonly nextTokenBudget: number
     readonly allowClosedStepOrphans: boolean
   }
+
+interface JobExecution {
+  readonly job: CompactionJob
+  readonly profiles: Map<string, SummaryCapacityProfile>
+  capacityKey: string | undefined
+}
 
 /** Stable terminal diagnosis when even the oldest balanced surface unit cannot be submitted. */
 export class OversizedSurfaceUnitError extends Error {
@@ -385,6 +410,67 @@ export class BasicCompactionEngine extends CompactionEngine {
     return ranges
   }
 
+  /** Add durable failures from a resumed job to the generation-local suppression map. */
+  private restoreFailedRanges(
+    session: Session,
+    restored: RestoredConvergence,
+  ): Map<string, FailedRange> {
+    const failed = this.rangeFailures(session)
+    for (const record of currentJobFailureRecords(
+      restored,
+      session.surface.replaceGeneration,
+    )) {
+      const rangeKey = `${record.range.start}:${record.range.end}`
+      if (failed.has(rangeKey)) continue
+      if (record.failureKind === 'non-shrinking'
+        && record.nonShrinkingSummaryTokens !== undefined
+        && record.nonShrinkingShadowedTokens !== undefined) {
+        failed.set(rangeKey, {
+          kind: 'non-shrinking',
+          error: new SummaryNotSmallerError(
+            record.nonShrinkingSummaryTokens,
+            record.nonShrinkingShadowedTokens,
+          ),
+        })
+      } else if (record.failureKind === 'input-too-large') {
+        failed.set(rangeKey, {
+          kind: 'input-too-large',
+          error: Object.assign(
+            new Error(record.failureMessage ?? 'restored summary input overflow'),
+            { code: CONTEXT_WINDOW_EXCEEDED_CODE },
+          ),
+          nextTokenBudget: record.nextTokenBudget
+            ?? learnedReplayBudget(record.capacity)
+            ?? Math.max(1, Math.floor(record.selectedSurfaceTokens / 2)),
+          allowClosedStepOrphans: false,
+        })
+      }
+    }
+    return failed
+  }
+
+  /** Price the current default-summary fixed envelope without dispatching. */
+  private async defaultEnvelopeHint(
+    agent: Agent,
+    policy: ResolvedConfig | ReturnType<typeof resolveTargetPolicy>,
+    signal: AbortSignal,
+  ): Promise<SummaryEnvelopeEstimate | undefined> {
+    if (this.summarize !== BasicCompactionEngine.prototype.summarize) return undefined
+    const header = agent.session.requestHeader()
+    return estimateDefaultSummaryEnvelope(
+      this.ctx,
+      this.ctx.tokenMeter,
+      policy,
+      {
+        ...header?.system === undefined ? {} : { system: header.system },
+        ...header?.tools === undefined ? {} : { tools: header.tools },
+        messages: [],
+      },
+      agent,
+      signal,
+    )
+  }
+
   /**
    * Compact one policy-selected range, shrinking only after a typed summary
    * context overflow. Preflight failures use their exact replay budget;
@@ -398,6 +484,7 @@ export class BasicCompactionEngine extends CompactionEngine {
     signal: AbortSignal,
     attemptedRanges: Set<string>,
     failedRanges: Map<string, FailedRange>,
+    execution: JobExecution,
     allowClosedStepOrphans = false,
   ): Promise<CompactionResult> {
     let range = initialRange
@@ -432,20 +519,61 @@ export class BasicCompactionEngine extends CompactionEngine {
       }
       attemptedRanges.add(rangeKey)
 
+      const profile = execution.capacityKey === undefined
+        ? undefined
+        : execution.profiles.get(execution.capacityKey)
+      const jobAttempt: CompactionJobAttempt = {
+        jobId: execution.job.jobId,
+        trigger: execution.job.trigger,
+        ...(execution.job.thresholdTokens === undefined
+          ? {}
+          : { thresholdTokens: execution.job.thresholdTokens }),
+        chunkIndex: execution.job.chunkIndex,
+        attemptIndex: execution.job.attemptIndex,
+        surfaceGenerationBefore: agent.session.surface.replaceGeneration,
+        requestTokensBefore: measurement.totalTokens,
+        surfaceTokensBefore: measurement.surfaceTokens,
+        range,
+        selectedSurfaceTokens: this.rangeTokens(measurement, range),
+        ...(execution.capacityKey === undefined ? {} : { capacityKey: execution.capacityKey }),
+        ...(profile === undefined ? {} : { capacity: profile }),
+      }
+
       try {
-        return await this.compactRegion(
+        const result = await this.compactRegion(
           range.start,
           range.end,
           agent,
           signal,
           allowOrphans,
+          jobAttempt,
         )
+        execution.job.attemptIndex += 1
+        const event = agent.session.events[result.summarySeq]
+        const record = event === undefined ? undefined : convergenceRecord(event)
+        if (record?.capacity !== undefined) {
+          execution.capacityKey = record.capacity.capacityKey
+          execution.profiles.set(record.capacity.capacityKey, record.capacity)
+        }
+        return result
       } catch (error: unknown) {
+        execution.job.attemptIndex += 1
         if (error instanceof SummaryNotSmallerError) {
           failedRanges.set(rangeKey, { kind: 'non-shrinking', error })
           throw error
         }
         if (!this.isSummaryContextOverflow(error)) throw error
+
+        if (error instanceof SummaryInputTooLargeError) {
+          execution.capacityKey = error.estimate.capacityKey
+          const learned = observeCapacity(
+            execution.profiles.get(error.estimate.capacityKey),
+            error.estimate,
+            'rejected',
+            Date.now(),
+          )
+          execution.profiles.set(error.estimate.capacityKey, learned)
+        }
 
         measurement = this.ctx.tokenMeter.measure(agent.session)
         const selectedTokens = this.rangeTokens(measurement, range)
@@ -474,6 +602,20 @@ export class BasicCompactionEngine extends CompactionEngine {
         allowOrphans = false
       }
     }
+  }
+
+  /** Apply a compatible learned replay cap without expanding the policy range. */
+  private capacityBoundedRange(
+    session: Session,
+    measurement: TokenMeasurement,
+    range: Range,
+    execution: JobExecution,
+  ): Range | null {
+    const budget = execution.capacityKey === undefined
+      ? undefined
+      : learnedReplayBudget(execution.profiles.get(execution.capacityKey))
+    if (budget === undefined || this.rangeTokens(measurement, range) <= budget) return range
+    return selectLargestCompactablePrefix(session, measurement, range.end, budget)
   }
 
   /** Select a strictly smaller balanced prefix under one message-token cap. */
@@ -507,15 +649,19 @@ export class BasicCompactionEngine extends CompactionEngine {
 
   /** Derive the next strict range budget from preflight facts or provider feedback. */
   private nextTokenBudget(selectedTokens: number, error: unknown): number {
-    if (error instanceof SummaryInputTooLargeError
-      && !error.providerRejected
-      && error.estimate.availableReplayTokens !== undefined) {
+    if (error instanceof SummaryInputTooLargeError) {
+      const replayBudget = error.providerRejected
+        ? error.providerReplayTokenLimit
+        : error.estimate.availableReplayTokens
+      if (replayBudget === undefined) {
+        return Math.min(selectedTokens - 1, Math.floor(selectedTokens / 2))
+      }
       if (error.estimate.replayMessageTokens === 0) return -1
       return Math.min(
         selectedTokens - 1,
         Math.floor(
           selectedTokens
-          * error.estimate.availableReplayTokens
+          * replayBudget
           / error.estimate.replayMessageTokens,
         ),
       )
@@ -592,39 +738,37 @@ export class BasicCompactionEngine extends CompactionEngine {
     }
 
     // Pruning is optional so compaction-convergent remains independently composable.
-    // Overflow always qualifies; pressure first resolves the routed model's
-    // capacity and checks its target-specific threshold.
+    // Overflow always executes at least one useful chunk; when route capacity is
+    // known, both triggers share the same below-threshold completion condition.
     const prune = this.ctx.get('toolResultPruner')
-
-    if (trigger === 'context-overflow') {
-      if (prune !== undefined) {
-        prune.pruneSession(agent.session)
-        measurement = meter.measure(agent.session)
-      }
-      const range = selectCompactableRange(agent.session, measurement, 0)
-      if (range === null) return null
-      return this.compactWithCapacityFallback(
-        range,
-        measurement,
-        agent,
-        signal,
-        new Set<string>(),
-        this.rangeFailures(agent.session),
-      )
+    let context: Awaited<ReturnType<typeof this.ctx.llm.resolveModelInfo>>['context']
+    try {
+      context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context
+    } catch (error: unknown) {
+      if (trigger === 'pressure') throw error
+      context = undefined
     }
-
-    const context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context
-    assertNoActiveCompaction(agent.session, 'automatic pressure compaction')
+    assertNoActiveCompaction(agent.session, 'automatic compaction')
     const targetKey = `${target.provider}/${target.model}`
-    if (context === undefined) {
+    if (context === undefined && trigger === 'pressure') {
       throw new TargetPressureConfigError(
         targetKey,
         `compaction-convergent: no context capacity for ${targetKey}; `
         + 'configure contextWindow on that adapter model',
       )
     }
-    const spec = resolveCompactSpec(policy, context.contextWindow)
-    if (measurement.totalTokens < spec.thresholdTokens) return null
+    let spec: ReturnType<typeof resolveCompactSpec> | undefined
+    if (context !== undefined) {
+      try {
+        spec = resolveCompactSpec(policy, context.contextWindow)
+      } catch (error: unknown) {
+        if (trigger === 'pressure') throw error
+        spec = undefined
+      }
+    }
+    if (trigger === 'pressure'
+      && spec !== undefined
+      && measurement.totalTokens < spec.thresholdTokens) return null
 
     // Once pressure qualifies, land the model-free pass before choosing a
     // summary range, then remeasure through the singleton replay fold.
@@ -632,19 +776,43 @@ export class BasicCompactionEngine extends CompactionEngine {
       prune.pruneSession(agent.session)
       measurement = meter.measure(agent.session)
     }
-    if (measurement.totalTokens < spec.thresholdTokens) return null
+    if (trigger === 'pressure'
+      && spec !== undefined
+      && measurement.totalTokens < spec.thresholdTokens) return null
 
+    const thresholdTokens = spec?.thresholdTokens
+    const restored = restoreConvergence(agent.session, trigger, thresholdTokens)
+    const hint = await this.defaultEnvelopeHint(agent, policy, signal)
+    const latestJobRecord = restored.records.findLast(record => record.jobId === restored.job.jobId)
+    const execution: JobExecution = {
+      job: restored.job,
+      profiles: restored.profiles,
+      capacityKey: hint?.capacityKey ?? latestJobRecord?.capacityKey,
+    }
     let result: CompactionResult | null = null
     const attemptedRanges = new Set<string>()
-    let failedRanges = this.rangeFailures(agent.session)
-    for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
+    let failedRanges = this.restoreFailedRanges(agent.session, restored)
+    let forceOverflowChunk = trigger === 'context-overflow'
+    while (forceOverflowChunk
+      || (thresholdTokens !== undefined && measurement.totalTokens >= thresholdTokens)) {
+      signal.throwIfAborted()
+      const generationBefore = agent.session.surface.replaceGeneration
+      const tokensBefore = measurement.totalTokens
       let compacted = false
       let nonShrinking: SummaryNotSmallerError | undefined
-      const budgets = expansionBudgets(spec.retainTokens)
+      const budgets = forceOverflowChunk
+        ? [0]
+        : expansionBudgets(spec?.retainTokens ?? 0)
       for (const [budgetIndex, retainTokens] of budgets.entries()) {
         if (budgetIndex > 0) measurement = meter.measure(agent.session)
-        const range = selectCompactableRange(agent.session, measurement, retainTokens)
-        if (range === null) continue
+        const selected = selectCompactableRange(agent.session, measurement, retainTokens)
+        if (selected === null) continue
+        const range = this.capacityBoundedRange(
+          agent.session,
+          measurement,
+          selected,
+          execution,
+        ) ?? selected
 
         try {
           result = await this.compactWithCapacityFallback(
@@ -654,6 +822,7 @@ export class BasicCompactionEngine extends CompactionEngine {
             signal,
             attemptedRanges,
             failedRanges,
+            execution,
           )
           compacted = true
           break
@@ -672,15 +841,23 @@ export class BasicCompactionEngine extends CompactionEngine {
           const selectedTokens = measurement.nodes
             .slice(startIdx, endIdx + 1)
             .reduce((total, node) => total + node.tokens, 0)
-          if (measurement.totalTokens - selectedTokens < spec.thresholdTokens) {
+          if (thresholdTokens === undefined
+            || measurement.totalTokens - selectedTokens < thresholdTokens) {
+            const bounded = this.capacityBoundedRange(
+              agent.session,
+              measurement,
+              range,
+              execution,
+            ) ?? range
             try {
               result = await this.compactWithCapacityFallback(
-                range,
+                bounded,
                 measurement,
                 agent,
                 signal,
                 attemptedRanges,
                 failedRanges,
+                execution,
                 true,
               )
               compacted = true
@@ -698,22 +875,32 @@ export class BasicCompactionEngine extends CompactionEngine {
             cause: nonShrinking,
           })
         }
-        /* v8 ignore else -- a committed replacement leaves a checkpoint range for the bounded follow-up attempt. */
         if (result === null) return null
-        /* v8 ignore next -- a committed replacement leaves a checkpoint range for the bounded follow-up attempt. */
-        break
+        throw new Error(
+          `compaction job ${execution.job.jobId} cannot select another shrinking balanced range `
+          + `while ${measurement.totalTokens} estimated tokens remain above threshold ${String(thresholdTokens)}`,
+        )
       }
 
       measurement = meter.measure(agent.session)
-      if (measurement.totalTokens < spec.thresholdTokens) return result
+      if (agent.session.surface.replaceGeneration <= generationBefore) {
+        throw new Error(
+          `compaction job ${execution.job.jobId} committed no replacement generation progress`,
+        )
+      }
+      if (measurement.totalTokens >= tokensBefore) {
+        throw new Error(
+          `compaction job ${execution.job.jobId} made no token progress `
+          + `(${measurement.totalTokens} after >= ${tokensBefore} before)`,
+        )
+      }
+      execution.job.chunkIndex += 1
+      forceOverflowChunk = false
+      if (thresholdTokens === undefined || measurement.totalTokens < thresholdTokens) return result
       attemptedRanges.clear()
       failedRanges = this.rangeFailures(agent.session)
     }
-
-    throw new Error(
-      `compaction still above threshold after ${spec.compactionRetries + 1} compaction attempts `
-      + `(${measurement.totalTokens} estimated tokens >= threshold ${spec.thresholdTokens})`,
-    )
+    return result
   }
 
   /**
@@ -731,7 +918,9 @@ export class BasicCompactionEngine extends CompactionEngine {
     agent: Agent,
     signal?: AbortSignal,
     allowClosedStepOrphans = false,
+    jobAttempt?: CompactionJobAttempt,
   ): Promise<CompactionResult> {
+    const sessions = this.ctx.get('sessions')
     return compactSurfaceRegion(
       this.regionDependencies(),
       agent.session,
@@ -742,6 +931,12 @@ export class BasicCompactionEngine extends CompactionEngine {
         owner: 'current-turn',
         stability: 'whole-surface',
         ...(allowClosedStepOrphans ? { allowClosedStepOrphans: true } : {}),
+        ...(jobAttempt === undefined ? {} : {
+          jobAttempt,
+          ...(sessions === undefined ? {} : {
+            flush: async () => { await sessions.flush(agent.session) },
+          }),
+        }),
       },
       signal,
     )

@@ -1,7 +1,10 @@
 import { describe, expect, expectTypeOf, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
-import BasicCompactionEngine, { OversizedSurfaceUnitError } from '@deepseek-ai/dsh-compaction-basic'
+import BasicCompactionEngine, {
+  OversizedSurfaceUnitError,
+  SummaryInputTooLargeError,
+} from '@deepseek-ai/dsh-compaction-basic'
 import type { BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic'
 import {
   selectCompactableRange,
@@ -9,6 +12,7 @@ import {
   SummaryNotSmallerError,
 } from '@deepseek-ai/dsh-compaction-basic/src/region.ts'
 import type { SummarizationInput, SummaryResult } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts'
+import { convergenceRecord } from '@deepseek-ai/dsh-compaction-basic/src/convergence.ts'
 import { CompactionId, toolPairingBalancedAfter, toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
 import {
   resolveCompactSpec,
@@ -771,20 +775,64 @@ describe('pressure measurement and retention', () => {
     expect(compactRegion).toHaveBeenCalledTimes(4)
   })
 
-  it('bounds retries when a shrinking checkpoint remains above threshold', async () => {
+  it('keeps committing shrinking chunks past the legacy retry cap until below threshold', async () => {
+    const ctx = createContext()
     const compact = service({
       auto: false,
       compactionRetries: 0,
       thresholdRatio: 0.3,
       retainTokens: 180,
-    })
+    }, ctx)
     compact.summary = Array.from({ length: 7 }, (_, index) => ({
       type: 'text',
       text: `summary ${index}`,
     }))
+    const session = conversation(4)
 
-    await expect(compactIfNeeded(compact, conversation(4)))
-      .rejects.toThrow(/still above threshold after 1 compaction attempts/)
+    await expect(compactIfNeeded(compact, session)).resolves.not.toBeNull()
+    expect(session.surface.replaceGeneration).toBeGreaterThan(1)
+    expect(ctx.tokenMeter.measure(session).totalTokens).toBeLessThan(300)
+  })
+
+  it('terminates when a claimed successful chunk makes no replacement-generation progress', async () => {
+    const compact = service({
+      auto: false,
+      thresholdRatio: 0.3,
+      retainTokens: 180,
+    })
+    const session = conversation(4)
+    const fake: CompactionResult = {
+      compactionId: CompactionId('no-progress'),
+      startSeq: 0,
+      summarySeq: 0,
+      endSeq: 0,
+      summary: [{ type: 'text', text: 'fake' }],
+      shadowedRange: { start: 1, end: 2 },
+      shadowedSeqs: [1, 2],
+      shadowedTokenCount: 1,
+    }
+    const region = vi.spyOn(compact, 'compactRegion').mockResolvedValue(fake)
+
+    await expect(compactIfNeeded(compact, session))
+      .rejects.toThrow(/no replacement generation progress/)
+    expect(region).toHaveBeenCalledTimes(1)
+  })
+
+  it('flushes every closed automatic chunk before continuing the job', async () => {
+    const ctx = createContext()
+    void new SessionStore(ctx)
+    const flush = vi.spyOn(ctx.sessions, 'flush').mockResolvedValue(true)
+    const compact = service({
+      auto: false,
+      thresholdRatio: 0.3,
+      retainTokens: 180,
+    }, ctx)
+    const session = conversation(4)
+
+    await expect(compactIfNeeded(compact, session)).resolves.not.toBeNull()
+
+    expect(flush).toHaveBeenCalledTimes(session.surface.replaceGeneration)
+    expect(flush).toHaveBeenCalledWith(session)
   })
 
   it('rounds a retention cut head-ward to preserve tool-call/result pairing', async () => {
@@ -1288,6 +1336,7 @@ class CapacitySummaryAdapter extends LlmAdapter {
   constructor(
     private readonly contextWindow: number,
     private readonly maximumReplayMessages = Number.POSITIVE_INFINITY,
+    private readonly onAccepted?: () => void,
   ) {
     super()
   }
@@ -1319,6 +1368,11 @@ class CapacitySummaryAdapter extends LlmAdapter {
     }
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'text-delta', index: 0, text: 'capacity checkpoint' }
+    this.onAccepted?.()
+    yield {
+      type: 'usage',
+      usage: { inputTokens: replayMessages * 100, outputTokens: 8 },
+    }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
 }
@@ -1328,14 +1382,7 @@ class ExposedCompactionEngine extends BasicCompactionEngine {
     input: SummarizationInput,
     owner: Agent,
     signal?: AbortSignal,
-  ): Promise<{
-    summary: ContentBlock[]
-    rawOutput?: ContentBlock[]
-    provider: string
-    model: string
-    maxTokens?: number
-    usage?: TokenUsage
-  }> {
+  ): Promise<SummaryResult> {
     return this.summarize(input, owner, signal)
   }
 }
@@ -1380,7 +1427,7 @@ describe('default one-shot summarizer', () => {
     adapter.usage = { inputTokens: 12, outputTokens: 3 }
     const output = await compact.runSummarize(promptInput('transcript'), agent(session, 'fallback'), SIGNAL)
 
-    expect(output).toEqual({
+    expect(output).toMatchObject({
       summary: [{ type: 'text', text: 'public summary' }],
       rawOutput: [
         { type: 'reasoning', text: 'private' },
@@ -1392,6 +1439,13 @@ describe('default one-shot summarizer', () => {
       model: MODEL,
       maxTokens: 321,
       usage: adapter.usage,
+    })
+    expect(output.summaryEnvelope).toMatchObject({
+      capacityKey: expect.stringMatching(new RegExp(`^${MODEL}/${MODEL}:[a-f0-9]{64}$`)),
+      provider: MODEL,
+      model: MODEL,
+      replayMessageTokens: expect.any(Number),
+      reservedOutputTokens: 321,
     })
     expect(adapter.lastOptions).toMatchObject({
       provider: MODEL,
@@ -1731,6 +1785,211 @@ describe('summary input capacity convergence', () => {
       .toHaveLength(adapter.requests.length)
   })
 
+  it('finishes a large surface in one job beyond the legacy successful-chunk cap', async () => {
+    const ctx = new Context()
+    void new LlmRuntime(ctx)
+    void new TokenMeter(ctx)
+    const adapter = new CapacitySummaryAdapter(10_000, 4)
+    ctx.llm.registerAdapter([MODEL], adapter)
+    const compact = new BasicCompactionEngine(ctx, {
+      auto: false,
+      thresholdRatio: 0.08,
+      retainTokens: 0,
+      maxTokens: 64,
+      compactionRetries: 0,
+    })
+    const session = conversation(18, 'x'.repeat(400))
+    const threshold = 800
+    expect(ctx.tokenMeter.measure(session).totalTokens).toBeGreaterThan(threshold * 4)
+
+    await expect(compactIfNeeded(compact, session, 'pressure')).resolves.not.toBeNull()
+
+    const records = session.events.flatMap(event => {
+      const record = convergenceRecord(event)
+      return record === undefined ? [] : [record]
+    })
+    const successes = records.filter(record => record.outcome === 'succeeded')
+    const starts = records.filter(record => record.outcome === 'started')
+    const firstAcceptedRequest = adapter.requests.findIndex(request => request.messages.length - 1 <= 4)
+    expect(successes.length).toBeGreaterThan(4)
+    expect(new Set(records.map(record => record.jobId)).size).toBe(1)
+    expect(successes.map(record => record.chunkIndex))
+      .toEqual(successes.map((_, index) => index))
+    expect(starts.map(record => record.attemptIndex))
+      .toEqual(starts.map((_, index) => index))
+    expect(successes.map(record => record.surfaceTokensAfter))
+      .toEqual([...successes.map(record => record.surfaceTokensAfter)].sort((a, b) => b! - a!))
+    expect(successes.every(record => record.requestTokensAfter! < record.requestTokensBefore))
+      .toBe(true)
+    expect(successes.slice(1).every((record, index) => (
+      record.requestTokensBefore === successes[index]!.requestTokensAfter
+    ))).toBe(true)
+    expect(successes.at(-1)).toMatchObject({
+      state: 'completed',
+      willContinueJob: false,
+      remainingToThreshold: 0,
+    })
+    expect(successes.every(record => (
+      record.requestTokensBefore !== undefined
+      && record.requestTokensAfter !== undefined
+      && record.surfaceTokensAfter !== undefined
+      && record.shadowedTokens !== undefined
+      && record.framedSummaryTokens !== undefined
+      && record.summaryEstimatedInputTokens !== undefined
+      && record.summaryReservedOutputTokens === 64
+      && record.providerInputTokens !== undefined
+      && record.providerOutputTokens === 8
+      && record.remainingToThreshold !== undefined
+    ))).toBe(true)
+    expect(firstAcceptedRequest).toBeGreaterThan(0)
+    expect(adapter.requests.slice(firstAcceptedRequest + 1)
+      .every(request => request.messages.length - 1 <= 4)).toBe(true)
+    expect(successes.at(-1)?.capacity).toMatchObject({
+      largestAcceptedReplayTokens: expect.any(Number),
+      smallestRejectedReplayTokens: expect.any(Number),
+      acceptedSamples: successes.length,
+      rejectedSamples: firstAcceptedRequest,
+      safetyMarginTokens: expect.any(Number),
+      firstObservedAt: expect.any(Number),
+      updatedAt: expect.any(Number),
+    })
+    const finalMeasurement = ctx.tokenMeter.measure(session)
+    expect(finalMeasurement.totalTokens).toBeLessThan(threshold)
+    expect(successes.at(-1)?.requestTokensAfter).toBe(finalMeasurement.totalTokens)
+    expect(successes.at(-1)?.surfaceTokensAfter).toBe(finalMeasurement.surfaceTokens)
+
+    const lifecycles = session.events.filter(event => (
+      event.type === 'compaction/start'
+      || event.type === 'compaction/summary'
+      || event.type === 'compaction/end'
+    ))
+    const byId = Map.groupBy(lifecycles, event => event.data.compactionId)
+    for (const events of byId.values()) {
+      expect(events.map(event => event.type)).toEqual(
+        events.some(event => event.type === 'compaction/summary')
+          ? ['compaction/start', 'compaction/summary', 'compaction/end']
+          : ['compaction/start', 'compaction/end'],
+      )
+    }
+  })
+
+  it('restores an unfinished job and learned capacity from durable compaction events', async () => {
+    const firstCtx = new Context()
+    void new LlmRuntime(firstCtx)
+    void new TokenMeter(firstCtx)
+    const controller = new AbortController()
+    const firstAdapter = new CapacitySummaryAdapter(10_000, 4, () => controller.abort('restart'))
+    firstCtx.llm.registerAdapter([MODEL], firstAdapter)
+    const firstEngine = new BasicCompactionEngine(firstCtx, {
+      auto: false,
+      thresholdRatio: 0.08,
+      retainTokens: 0,
+      maxTokens: 64,
+      compactionRetries: 0,
+    })
+    const original = conversation(14, 'x'.repeat(400))
+
+    await expect(firstEngine.compactIfNeeded(
+      agent(original, MODEL),
+      'pressure',
+      controller.signal,
+    )).rejects.toBeDefined()
+    const firstRecords = original.events.flatMap(event => {
+      const record = convergenceRecord(event)
+      return record === undefined ? [] : [record]
+    })
+    const firstSuccess = firstRecords.findLast(record => record.outcome === 'succeeded')!
+    expect(firstSuccess.willContinueJob).toBe(true)
+    const originalProbe = firstAdapter.requests[0]!.messages.length - 1
+
+    const resumed = Session.create(SessionId('capacity-job-resumed'), [...original.events])
+    const secondCtx = new Context()
+    void new LlmRuntime(secondCtx)
+    void new TokenMeter(secondCtx)
+    const secondAdapter = new CapacitySummaryAdapter(10_000, 4)
+    secondCtx.llm.registerAdapter([MODEL], secondAdapter)
+    const secondEngine = new BasicCompactionEngine(secondCtx, {
+      auto: false,
+      thresholdRatio: 0.08,
+      retainTokens: 0,
+      maxTokens: 64,
+      compactionRetries: 0,
+    })
+
+    await expect(compactIfNeeded(secondEngine, resumed, 'pressure')).resolves.not.toBeNull()
+
+    const allRecords = resumed.events.flatMap(event => {
+      const record = convergenceRecord(event)
+      return record === undefined ? [] : [record]
+    })
+    const successes = allRecords.filter(record => record.outcome === 'succeeded')
+    expect(new Set(allRecords.map(record => record.jobId))).toEqual(new Set([firstSuccess.jobId]))
+    expect(successes.map(record => record.chunkIndex))
+      .toEqual(successes.map((_, index) => index))
+    expect(secondAdapter.requests[0]!.messages.length - 1).toBeLessThan(originalProbe)
+    expect(secondCtx.tokenMeter.measure(resumed).totalTokens).toBeLessThan(800)
+  })
+
+  it('changes the capacity fingerprint when fixed summary envelope inputs change', async () => {
+    const run = async (
+      system: string,
+      maxTokens: number,
+      contextWindow: number,
+      route = MODEL,
+    ) => {
+      const { compact, ctx } = await summarizerHarness(
+        [{ type: 'text', text: 'summary' }],
+        undefined,
+        route,
+        {
+          auto: false,
+          maxTokens,
+          summarizationProvider: route,
+          summarizationModel: route,
+        },
+      )
+      vi.spyOn(ctx.llm, 'resolveModelInfo').mockResolvedValue({
+        provider: route,
+        id: route,
+        name: route,
+        context: { contextWindow },
+      })
+      return (await compact.runSummarize({
+        system,
+        tools: [{ name: 'tool', description: system, parameters: { type: 'object' } }],
+        ...promptInput('history'),
+      }, agent(conversation(1), MODEL))).summaryEnvelope!.capacityKey
+    }
+
+    const baseline = await run('system-a', 64, 10_000)
+    expect(await run('system-b', 64, 10_000)).not.toBe(baseline)
+    expect(await run('system-a', 128, 10_000)).not.toBe(baseline)
+    expect(await run('system-a', 64, 20_000)).not.toBe(baseline)
+    expect(await run('system-a', 64, 10_000, 'alternate-summary')).not.toBe(baseline)
+  })
+
+  it('uses a provider-reported token gap when the overflow message exposes it', () => {
+    const estimate = {
+      capacityKey: 'provider/model:fingerprint',
+      provider: 'provider',
+      model: 'model',
+      contextWindow: 200_000,
+      replayMessageTokens: 180_000,
+      fixedEnvelopeTokens: 10_000,
+      instructionTokens: 1_000,
+      estimatedInputTokens: 191_000,
+      reservedOutputTokens: 8_000,
+      availableReplayTokens: 181_000,
+    }
+    const error = new SummaryInputTooLargeError(estimate, true, {
+      cause: new Error(
+        'maximum context length is 200,000 tokens. However, your messages resulted in 244,000 tokens',
+      ),
+    })
+
+    expect(error.providerReplayTokenLimit).toBe(136_000)
+  })
+
   it('shrinks after provider context overflow and submits each range at most once', async () => {
     const { adapter, compact } = capacityService(10_000, 3)
     const session = conversation(6, 'x'.repeat(400))
@@ -2037,23 +2296,22 @@ describe('automatic listener and loader composition', () => {
     expect(session.surface.replaceGeneration).toBe(1)
   })
 
-  it('preserves the newest whole tool-call/result pair during forced overflow compaction', async () => {
+  it('preserves tool-call/result atomicity across every forced overflow chunk', async () => {
     const ctx = createContext()
     void new TestCompactionEngine(ctx, {
       thresholdRatio: 1,
       retainTokens: 90,
     })
     const session = toolConversation()
-    const newestAssistant = session.surface.nodes.at(-2)!
-    const newestResult = session.surface.nodes.at(-1)!
-
     expect(await recover(ctx, agent(session, MODEL), overflow())).toBe(true)
-    const currentAssistant = session.surface.nodes.find(node => node === newestAssistant)
-    const currentResult = session.surface.nodes.find(node => node === newestResult)
-    expect(currentAssistant).toBeDefined()
-    expect(currentResult).toBeDefined()
-    expect(toolPairingBalancedBefore(session, currentAssistant!)).toBe(true)
-    expect(toolPairingBalancedAfter(session, currentResult!)).toBe(true)
+    const messages = session.deriveMessages()
+    const calls = new Set<string>()
+    for (const message of messages) {
+      for (const block of message.content) {
+        if (block.type === 'tool-call') calls.add(block.id)
+        if (block.type === 'tool-result') expect(calls.has(block.toolCallId)).toBe(true)
+      }
+    }
   })
 
   it('does not retry when a backend reports success without replacing the surface', async () => {
@@ -2148,6 +2406,26 @@ describe('automatic listener and loader composition', () => {
     })
     expect(await recover(ctx, agent(session, MODEL), overflow('unlisted-model overflow')))
       .toBe(true)
+    const record = session.events
+      .map(event => convergenceRecord(event))
+      .findLast(candidate => candidate?.outcome === 'succeeded')
+    expect(record).toMatchObject({ state: 'one-shot', willContinueJob: false })
+  })
+
+  it('keeps one-shot overflow recovery when the pressure retention policy cannot resolve', async () => {
+    const ctx = createContext()
+    void new TestCompactionEngine(ctx, {
+      thresholdRatio: 0.5,
+      retainTokens: 500,
+    })
+    const session = conversation(3)
+
+    expect(await recover(ctx, agent(session, MODEL), overflow('policy-independent overflow')))
+      .toBe(true)
+    const record = session.events
+      .map(event => convergenceRecord(event))
+      .findLast(candidate => candidate?.outcome === 'succeeded')
+    expect(record).toMatchObject({ state: 'one-shot', willContinueJob: false })
   })
 
   it('delegates canonical overflow when no durable routed target exists', async () => {
