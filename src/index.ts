@@ -8,7 +8,7 @@ import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { CompactionEngine, ManualCompactionError } from '@deepseek-ai/dsh-compaction'
 import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
-import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
+import type { TokenMeasurement, TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import type { Session } from '@deepseek-ai/dsh-session'
 import { CONTEXT_WINDOW_EXCEEDED_CODE, assertNever, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
@@ -25,11 +25,13 @@ import {
 import {
   assertNoActiveCompaction,
   compactSurfaceRegion,
+  oldestCompactableSurfaceUnit,
   selectCompactableRange,
+  selectLargestCompactablePrefix,
   selectMaximalCompactableRange,
   SummaryNotSmallerError,
 } from './region.ts'
-import { summarizeWithLlm } from './summarizer.ts'
+import { summarizeWithLlm, SummaryInputTooLargeError } from './summarizer.ts'
 import type { SummarizationInput, SummaryResult } from './summarizer.ts'
 import type {
   BasicCompactionConfig,
@@ -46,8 +48,55 @@ export type {
   ResolvedRetention,
   ResolvedTargetPolicy,
 } from './types.ts'
+export type { SummaryEnvelopeEstimate } from './summarizer.ts'
 
 export { SummaryNotSmallerError } from './region.ts'
+export { SummaryInputTooLargeError } from './summarizer.ts'
+
+type Range = { readonly start: number; readonly end: number }
+
+type FailedRange =
+  | { readonly kind: 'non-shrinking'; readonly error: SummaryNotSmallerError }
+  | {
+    readonly kind: 'input-too-large'
+    readonly error: unknown
+    readonly nextTokenBudget: number
+    readonly allowClosedStepOrphans: boolean
+  }
+
+/** Stable terminal diagnosis when even the oldest balanced surface unit cannot be submitted. */
+export class OversizedSurfaceUnitError extends Error {
+  readonly code = 'SUMMARY_SURFACE_UNIT_TOO_LARGE'
+
+  constructor(
+    readonly unit: { readonly start: number; readonly end: number; readonly tokens: number },
+    readonly availableReplayTokens: number | undefined,
+    readonly contextWindow: number | undefined,
+    readonly fixedEnvelopeTokens: number | undefined,
+    readonly instructionTokens: number | undefined,
+    readonly reservedOutputTokens: number | undefined,
+    options?: ErrorOptions,
+  ) {
+    const budget = availableReplayTokens === undefined
+      ? 'after the provider rejected that unit as context overflow'
+      : `because it exceeds replay budget ${availableReplayTokens}`
+    const capacity = contextWindow === undefined
+      ? ''
+      : ` within context window ${contextWindow}`
+    const envelope = fixedEnvelopeTokens === undefined
+      || instructionTokens === undefined
+      || reservedOutputTokens === undefined
+      ? ''
+      : ` after fixed envelope ${fixedEnvelopeTokens}, instruction ${instructionTokens}, `
+        + `and output reserve ${reservedOutputTokens}`
+    super(
+      `summarization cannot fit the oldest indivisible surface unit `
+      + `(seqs ${unit.start}-${unit.end}, ~${unit.tokens} message tokens) ${budget}${capacity}${envelope}`,
+      options,
+    )
+    this.name = 'OversizedSurfaceUnitError'
+  }
+}
 
 /** Increasingly aggressive retained-tail budgets for one shrinking attempt. */
 function expansionBudgets(retainTokens: number): readonly number[] {
@@ -110,10 +159,10 @@ const modelPolicy: z<ModelCompactPolicyConfig> = z.object({
  * token meter.
  */
 export class BasicCompactionEngine extends CompactionEngine {
-  /** Non-shrinking ranges remain suppressed until the durable surface advances. */
+  /** Non-shrinking and provider-rejected ranges stay suppressed until the surface advances. */
   private readonly failedRanges = new WeakMap<Session, {
     readonly generation: number
-    readonly ranges: Set<string>
+    readonly ranges: Map<string, FailedRange>
   }>()
 
   static inject = ['llm', 'tokenMeter', 'sessions']
@@ -261,7 +310,7 @@ export class BasicCompactionEngine extends CompactionEngine {
     if (this.historicalRepairSessions.has(agent.session)) {
       return this.summarizeHistorical(input, agent, config, signal)
     }
-    return summarizeWithLlm(this.ctx, config, input, agent, signal)
+    return summarizeWithLlm(this.ctx, this.ctx.tokenMeter, config, input, agent, signal)
   }
 
   /** Reduce an oversized historical surface through balanced chronological chunks. */
@@ -289,17 +338,26 @@ export class BasicCompactionEngine extends CompactionEngine {
       }
     }
     if (chunk.length > 0) chunks.push(chunk)
-    if (chunks.length <= 1) return summarizeWithLlm(this.ctx, config, input, agent, signal)
+    if (chunks.length <= 1) {
+      return summarizeWithLlm(this.ctx, this.ctx.tokenMeter, config, input, agent, signal)
+    }
 
     let summaries: SummaryResult[] = []
     for (const messages of chunks) {
-      summaries.push(await summarizeWithLlm(this.ctx, config, { messages }, agent, signal))
+      summaries.push(await summarizeWithLlm(
+        this.ctx,
+        this.ctx.tokenMeter,
+        config,
+        { messages },
+        agent,
+        signal,
+      ))
     }
     while (summaries.length > 1) {
       const next: SummaryResult[] = []
       for (let index = 0; index < summaries.length; index += 8) {
         const group = summaries.slice(index, index + 8)
-        next.push(await summarizeWithLlm(this.ctx, config, {
+        next.push(await summarizeWithLlm(this.ctx, this.ctx.tokenMeter, config, {
           messages: group.map((summary, part) => createUserMessage({
             content: [{
               type: 'text',
@@ -315,6 +373,192 @@ export class BasicCompactionEngine extends CompactionEngine {
       summaries = next
     }
     return summaries[0]!
+  }
+
+  /** Return the generation-scoped range failure cache for one live surface. */
+  private rangeFailures(session: Session): Map<string, FailedRange> {
+    const generation = session.surface.replaceGeneration
+    const cached = this.failedRanges.get(session)
+    if (cached?.generation === generation) return cached.ranges
+    const ranges = new Map<string, FailedRange>()
+    this.failedRanges.set(session, { generation, ranges })
+    return ranges
+  }
+
+  /**
+   * Compact one policy-selected range, shrinking only after a typed summary
+   * context overflow. Preflight failures use their exact replay budget;
+   * provider rejections halve the prior range because tokenizer drift is not
+   * observable through the heuristic meter.
+   */
+  private async compactWithCapacityFallback(
+    initialRange: Range,
+    initialMeasurement: TokenMeasurement,
+    agent: Agent,
+    signal: AbortSignal,
+    attemptedRanges: Set<string>,
+    failedRanges: Map<string, FailedRange>,
+    allowClosedStepOrphans = false,
+  ): Promise<CompactionResult> {
+    let range = initialRange
+    let measurement = initialMeasurement
+    let allowOrphans = allowClosedStepOrphans
+
+    while (true) {
+      const rangeKey = `${range.start}:${range.end}`
+      const cached = failedRanges.get(rangeKey)
+      if (cached?.kind === 'non-shrinking') throw cached.error
+      if (cached?.kind === 'input-too-large') {
+        const smaller = this.smallerRange(
+          agent.session,
+          measurement,
+          range,
+          cached.nextTokenBudget,
+        )
+        if (smaller === null) {
+          throw this.oversizedUnitError(
+            agent.session,
+            measurement,
+            cached.error,
+            cached.allowClosedStepOrphans,
+          )
+        }
+        range = smaller
+        allowOrphans = false
+        continue
+      }
+      if (attemptedRanges.has(rangeKey)) {
+        throw new Error(`compaction: range ${rangeKey} was selected twice without a recorded failure`)
+      }
+      attemptedRanges.add(rangeKey)
+
+      try {
+        return await this.compactRegion(
+          range.start,
+          range.end,
+          agent,
+          signal,
+          allowOrphans,
+        )
+      } catch (error: unknown) {
+        if (error instanceof SummaryNotSmallerError) {
+          failedRanges.set(rangeKey, { kind: 'non-shrinking', error })
+          throw error
+        }
+        if (!this.isSummaryContextOverflow(error)) throw error
+
+        measurement = this.ctx.tokenMeter.measure(agent.session)
+        const selectedTokens = this.rangeTokens(measurement, range)
+        const nextTokenBudget = this.nextTokenBudget(selectedTokens, error)
+        failedRanges.set(rangeKey, {
+          kind: 'input-too-large',
+          error,
+          nextTokenBudget,
+          allowClosedStepOrphans: allowOrphans,
+        })
+        const smaller = this.smallerRange(
+          agent.session,
+          measurement,
+          range,
+          nextTokenBudget,
+        )
+        if (smaller === null) {
+          throw this.oversizedUnitError(
+            agent.session,
+            measurement,
+            error,
+            allowOrphans,
+          )
+        }
+        range = smaller
+        allowOrphans = false
+      }
+    }
+  }
+
+  /** Select a strictly smaller balanced prefix under one message-token cap. */
+  private smallerRange(
+    session: Session,
+    measurement: TokenMeasurement,
+    range: Range,
+    maxTokens: number,
+  ): Range | null {
+    const endIdx = measurement.nodes.findIndex(node => node.seq === range.end)
+    if (endIdx <= 0) return null
+    return selectLargestCompactablePrefix(
+      session,
+      measurement,
+      measurement.nodes[endIdx - 1]!.seq,
+      maxTokens,
+    )
+  }
+
+  /** Read the heuristic token count for one current positional range. */
+  private rangeTokens(measurement: TokenMeasurement, range: Range): number {
+    const startIdx = measurement.nodes.findIndex(node => node.seq === range.start)
+    const endIdx = measurement.nodes.findIndex(node => node.seq === range.end)
+    if (startIdx === -1 || endIdx < startIdx) {
+      throw new Error(`compaction: selected range ${range.start}:${range.end} is absent from token measurement`)
+    }
+    return measurement.nodes
+      .slice(startIdx, endIdx + 1)
+      .reduce((total, node) => total + node.tokens, 0)
+  }
+
+  /** Derive the next strict range budget from preflight facts or provider feedback. */
+  private nextTokenBudget(selectedTokens: number, error: unknown): number {
+    if (error instanceof SummaryInputTooLargeError
+      && !error.providerRejected
+      && error.estimate.availableReplayTokens !== undefined) {
+      if (error.estimate.replayMessageTokens === 0) return -1
+      return Math.min(
+        selectedTokens - 1,
+        Math.floor(
+          selectedTokens
+          * error.estimate.availableReplayTokens
+          / error.estimate.replayMessageTokens,
+        ),
+      )
+    }
+    return Math.min(selectedTokens - 1, Math.floor(selectedTokens / 2))
+  }
+
+  /** Route only canonical summary context failures into range reduction. */
+  private isSummaryContextOverflow(error: unknown): boolean {
+    return error instanceof SummaryInputTooLargeError
+      || (typeof error === 'object'
+        && error !== null
+        && 'code' in error
+        && error.code === CONTEXT_WINDOW_EXCEEDED_CODE)
+  }
+
+  /** Build the finite terminal error for an oversized oldest balanced unit. */
+  private oversizedUnitError(
+    session: Session,
+    measurement: TokenMeasurement,
+    cause: unknown,
+    allowClosedStepOrphans: boolean,
+  ): OversizedSurfaceUnitError {
+    const unit = oldestCompactableSurfaceUnit(session, measurement, allowClosedStepOrphans)
+      ?? (() => {
+        const first = measurement.nodes[0]
+        if (first === undefined) {
+          throw new Error('compaction: oversized-unit diagnosis has no surface node')
+        }
+        return { start: first.seq, end: first.seq, tokens: first.tokens }
+      })()
+    const estimate = cause instanceof SummaryInputTooLargeError ? cause.estimate : undefined
+    return new OversizedSurfaceUnitError(
+      unit,
+      cause instanceof SummaryInputTooLargeError && cause.providerRejected
+        ? undefined
+        : estimate?.availableReplayTokens,
+      estimate?.contextWindow,
+      estimate?.fixedEnvelopeTokens,
+      estimate?.instructionTokens,
+      estimate?.reservedOutputTokens,
+      { cause },
+    )
   }
 
   /**
@@ -359,7 +603,14 @@ export class BasicCompactionEngine extends CompactionEngine {
       }
       const range = selectCompactableRange(agent.session, measurement, 0)
       if (range === null) return null
-      return this.compactRegion(range.start, range.end, agent, signal)
+      return this.compactWithCapacityFallback(
+        range,
+        measurement,
+        agent,
+        signal,
+        new Set<string>(),
+        this.rangeFailures(agent.session),
+      )
     }
 
     const context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context
@@ -385,44 +636,34 @@ export class BasicCompactionEngine extends CompactionEngine {
 
     let result: CompactionResult | null = null
     const attemptedRanges = new Set<string>()
-    const generation = agent.session.surface.replaceGeneration
-    const cached = this.failedRanges.get(agent.session)
-    const failedRanges = cached?.generation === generation
-      ? cached.ranges
-      : new Set<string>()
-    if (cached?.generation !== generation) {
-      this.failedRanges.set(agent.session, { generation, ranges: failedRanges })
-    }
+    let failedRanges = this.rangeFailures(agent.session)
     for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
       let compacted = false
       let nonShrinking: SummaryNotSmallerError | undefined
-      let cachedNonShrinking = false
       const budgets = expansionBudgets(spec.retainTokens)
       for (const [budgetIndex, retainTokens] of budgets.entries()) {
         if (budgetIndex > 0) measurement = meter.measure(agent.session)
         const range = selectCompactableRange(agent.session, measurement, retainTokens)
         if (range === null) continue
 
-        const rangeKey = `${range.start}:${range.end}`
-        if (attemptedRanges.has(rangeKey)) continue
-        attemptedRanges.add(rangeKey)
-        if (failedRanges.has(rangeKey)) {
-          cachedNonShrinking = true
-          continue
-        }
-
         try {
-          result = await this.compactRegion(range.start, range.end, agent, signal)
+          result = await this.compactWithCapacityFallback(
+            range,
+            measurement,
+            agent,
+            signal,
+            attemptedRanges,
+            failedRanges,
+          )
           compacted = true
           break
         } catch (error: unknown) {
           if (!(error instanceof SummaryNotSmallerError)) throw error
           nonShrinking = error
-          failedRanges.add(rangeKey)
         }
       }
 
-      if (!compacted && (nonShrinking !== undefined || cachedNonShrinking)) {
+      if (!compacted && nonShrinking !== undefined) {
         measurement = meter.measure(agent.session)
         const range = selectMaximalCompactableRange(agent.session, measurement)
         if (range !== null) {
@@ -432,28 +673,29 @@ export class BasicCompactionEngine extends CompactionEngine {
             .slice(startIdx, endIdx + 1)
             .reduce((total, node) => total + node.tokens, 0)
           if (measurement.totalTokens - selectedTokens < spec.thresholdTokens) {
-            const rangeKey = `${range.start}:${range.end}`
-            if (!attemptedRanges.has(rangeKey) && !failedRanges.has(rangeKey)) {
-              attemptedRanges.add(rangeKey)
-              try {
-                result = await this.compactRegion(range.start, range.end, agent, signal, true)
-                compacted = true
-              } catch (error: unknown) {
-                if (!(error instanceof SummaryNotSmallerError)) throw error
-                nonShrinking = error
-                failedRanges.add(rangeKey)
-              }
-            } else if (failedRanges.has(rangeKey)) {
-              cachedNonShrinking = true
+            try {
+              result = await this.compactWithCapacityFallback(
+                range,
+                measurement,
+                agent,
+                signal,
+                attemptedRanges,
+                failedRanges,
+                true,
+              )
+              compacted = true
+            } catch (error: unknown) {
+              if (!(error instanceof SummaryNotSmallerError)) throw error
+              nonShrinking = error
             }
           }
         }
       }
 
       if (!compacted) {
-        if (nonShrinking !== undefined || cachedNonShrinking) {
+        if (nonShrinking !== undefined) {
           throw new Error('compaction cannot find a shrinking balanced range', {
-            ...nonShrinking === undefined ? {} : { cause: nonShrinking },
+            cause: nonShrinking,
           })
         }
         /* v8 ignore else -- a committed replacement leaves a checkpoint range for the bounded follow-up attempt. */
@@ -464,6 +706,8 @@ export class BasicCompactionEngine extends CompactionEngine {
 
       measurement = meter.measure(agent.session)
       if (measurement.totalTokens < spec.thresholdTokens) return result
+      attemptedRanges.clear()
+      failedRanges = this.rangeFailures(agent.session)
     }
 
     throw new Error(

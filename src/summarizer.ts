@@ -5,11 +5,18 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { contentHasImage, createUserMessage, BlockAssembler, LlmError } from '@deepseek-ai/dsh-llm'
+import {
+  contentHasImage,
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  createUserMessage,
+  BlockAssembler,
+  LlmError,
+} from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock, FinishReason, GenerateOptions, Message, TokenUsage, ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
 
 interface SummaryConfig {
   readonly summarizationProvider: string
@@ -107,11 +114,95 @@ export type SummaryResult = {
   }
 )
 
+/** Complete request-budget facts for one default summarization call. */
+export interface SummaryEnvelopeEstimate {
+  readonly provider: string
+  readonly model: string
+  readonly contextWindow: number | undefined
+  readonly replayMessageTokens: number
+  readonly fixedEnvelopeTokens: number
+  readonly instructionTokens: number
+  readonly estimatedInputTokens: number
+  readonly reservedOutputTokens: number
+  readonly availableReplayTokens: number | undefined
+}
+
+/** A summary range that cannot be submitted to its resolved model as one request. */
+export class SummaryInputTooLargeError extends LlmError {
+  constructor(
+    readonly estimate: SummaryEnvelopeEstimate,
+    readonly providerRejected: boolean,
+    options?: ErrorOptions,
+  ) {
+    const capacity = estimate.contextWindow === undefined
+      ? 'unknown context capacity'
+      : `context window ${estimate.contextWindow}`
+    const disposition = providerRejected
+      ? 'provider rejected the request as context overflow'
+      : 'preflight rejected the request before model dispatch'
+    super(
+      `summarization input is too large for ${estimate.provider}/${estimate.model}: ${disposition} `
+      + `(estimated input ${estimate.estimatedInputTokens} + output reserve ${estimate.reservedOutputTokens}; `
+      + `${capacity}; replay messages ${estimate.replayMessageTokens}, fixed envelope `
+      + `${estimate.fixedEnvelopeTokens}, instruction ${estimate.instructionTokens})`,
+      CONTEXT_WINDOW_EXCEEDED_CODE,
+      options,
+    )
+  }
+}
+
+/** Build the exact trailing instruction message shared by estimation and dispatch. */
+function compactionInstructionMessage(): Message {
+  return createUserMessage({
+    content: [{ type: 'text', text: COMPACTION_INSTRUCTION }],
+    source: { kind: 'plugin', plugin: 'dsh-compaction-convergent' },
+  })
+}
+
+/** Price the full default summary request, including its non-message envelope and output reserve. */
+function estimateSummaryEnvelope(
+  meter: TokenMeter,
+  input: SummarizationInput,
+  agent: Agent,
+  provider: string,
+  model: string,
+  maxTokens: number,
+  instruction: Message,
+  contextWindow: number | undefined,
+): SummaryEnvelopeEstimate {
+  const envelope = meter.measure(agent.session, {
+    config: { provider, model, maxTokens },
+    ...input.system === undefined ? {} : { system: input.system },
+    ...input.tools === undefined ? {} : { tools: [...input.tools] },
+  })
+  const fixedEnvelopeTokens = Math.max(0, envelope.totalTokens - envelope.surfaceTokens)
+  const replayMessageTokens = input.messages.reduce(
+    (total, message) => total + meter.estimateMessage(message),
+    0,
+  )
+  const instructionTokens = meter.estimateMessage(instruction)
+  const estimatedInputTokens = fixedEnvelopeTokens + replayMessageTokens + instructionTokens
+  return {
+    provider,
+    model,
+    contextWindow,
+    replayMessageTokens,
+    fixedEnvelopeTokens,
+    instructionTokens,
+    estimatedInputTokens,
+    reservedOutputTokens: maxTokens,
+    availableReplayTokens: contextWindow === undefined
+      ? undefined
+      : Math.max(0, contextWindow - fixedEnvelopeTokens - instructionTokens - maxTokens),
+  }
+}
+
 /**
  * Run the default cache-reusing `ctx.llm.stream()` summarization call: replay
  * the conversation prefix, then append the compaction instruction as the final
  * user message so the provider's warm prefix cache is reused.
  * @param ctx - context providing the LLM service.
+ * @param meter - singleton replay-aware meter used for the complete request preflight.
  * @param config - resolved backend configuration.
  * @param input - replayed conversation prefix (system, tools, and leading messages) to condense.
  * @param agent - supplies routed-model history, fallback model, and session id.
@@ -120,6 +211,7 @@ export type SummaryResult = {
  */
 export async function summarizeWithLlm(
   ctx: Context,
+  meter: TokenMeter,
   config: SummaryConfig,
   input: SummarizationInput,
   agent: Agent,
@@ -142,13 +234,10 @@ export async function summarizeWithLlm(
     )
   }
 
-  const assembler = new BlockAssembler()
+  const instruction = compactionInstructionMessage()
   const messages: Message[] = [
     ...input.messages,
-    createUserMessage({
-      content: [{ type: 'text', text: COMPACTION_INSTRUCTION }],
-      source: { kind: 'plugin', plugin: 'dsh-compaction-convergent' },
-    }),
+    instruction,
   ]
   const options: GenerateOptions = {
     provider: target.provider,
@@ -161,9 +250,31 @@ export async function summarizeWithLlm(
     purpose: 'compaction',
     ...signal === undefined ? {} : { signal },
   }
+  const modelInfo = await ctx.llm.resolveModelInfo(target.provider, target.model, signal)
+  const estimate = estimateSummaryEnvelope(
+    meter,
+    input,
+    agent,
+    target.provider,
+    target.model,
+    config.maxTokens,
+    instruction,
+    modelInfo.context?.contextWindow,
+  )
+  if (estimate.contextWindow !== undefined
+    && estimate.estimatedInputTokens + estimate.reservedOutputTokens > estimate.contextWindow) {
+    throw new SummaryInputTooLargeError(estimate, false)
+  }
+
+  const assembler = new BlockAssembler()
   for await (const chunk of ctx.llm.stream(options)) assembler.push(chunk)
   const error = finishError(assembler.finish)
-  if (error !== undefined) throw error
+  if (error !== undefined) {
+    if ((error as Error & { code?: string }).code === CONTEXT_WINDOW_EXCEEDED_CODE) {
+      throw new SummaryInputTooLargeError(estimate, true, { cause: error })
+    }
+    throw error
+  }
 
   const rawOutput = assembler.blocks()
   const summary = summaryText(rawOutput)

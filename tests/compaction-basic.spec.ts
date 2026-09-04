@@ -1,7 +1,7 @@
 import { describe, expect, expectTypeOf, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
-import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
+import BasicCompactionEngine, { OversizedSurfaceUnitError } from '@deepseek-ai/dsh-compaction-basic'
 import type { BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic'
 import {
   selectCompactableRange,
@@ -1281,6 +1281,48 @@ class ScriptedAdapter extends LlmAdapter {
   }
 }
 
+/** Summary adapter with real capacity metadata and optional provider-side overflow. */
+class CapacitySummaryAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
+
+  constructor(
+    private readonly contextWindow: number,
+    private readonly maximumReplayMessages = Number.POSITIVE_INFINITY,
+  ) {
+    super()
+  }
+
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({
+      provider,
+      id: model,
+      name: model,
+      context: { contextWindow: this.contextWindow },
+    })
+  }
+
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.requests.push(options)
+    const replayMessages = options.messages.length - 1
+    if (replayMessages > this.maximumReplayMessages) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: 'summary input exceeds the context window of this model',
+            code: CONTEXT_WINDOW_EXCEEDED_CODE,
+          },
+        },
+      }
+      return
+    }
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text: 'capacity checkpoint' }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
 class ExposedCompactionEngine extends BasicCompactionEngine {
   runSummarize(
     input: SummarizationInput,
@@ -1575,6 +1617,205 @@ describe('default one-shot summarizer', () => {
     }])
     await expect(compact.runSummarize(promptInput('history'), agent(conversation(1), MODEL)))
       .rejects.toMatchObject({ code: 'UNSUPPORTED_CONTENT' })
+  })
+})
+
+describe('summary input capacity convergence', () => {
+  function capacityService(
+    contextWindow: number,
+    maximumReplayMessages = Number.POSITIVE_INFINITY,
+  ): { ctx: Context; adapter: CapacitySummaryAdapter; compact: BasicCompactionEngine } {
+    const ctx = new Context()
+    void new LlmRuntime(ctx)
+    void new TokenMeter(ctx)
+    const adapter = new CapacitySummaryAdapter(contextWindow, maximumReplayMessages)
+    ctx.llm.registerAdapter([MODEL], adapter)
+    const compact = new BasicCompactionEngine(ctx, {
+      auto: false,
+      maxTokens: 64,
+      compactionRetries: 0,
+    })
+    return { ctx, adapter, compact }
+  }
+
+  it('budgets system, tools, instruction, and output before dispatching the largest balanced prefix', async () => {
+    const run = async (withEnvelope: boolean) => {
+      const { ctx, adapter, compact } = capacityService(1_800)
+      const session = conversation(5, 'x'.repeat(400))
+      if (withEnvelope) {
+        session.append('request/header', {
+          header: {
+            config: { provider: MODEL, model: MODEL },
+            system: 'system '.repeat(180),
+            tools: [{
+              name: 'large_tool',
+              description: 'description '.repeat(120),
+              parameters: { type: 'object', properties: { value: { type: 'string' } } },
+            }],
+          },
+          reason: 'resume',
+        })
+      }
+      const measurement = ctx.tokenMeter.measure(session)
+      const maximal = selectCompactableRange(session, measurement, 0)!
+      const maximalNodes = measurement.nodes.filter(node =>
+        node.seq >= maximal.start && node.seq <= maximal.end).length
+      const result = await compactIfNeeded(compact, session, 'context-overflow')
+      return { ctx, adapter, maximalNodes, measurement, result, session }
+    }
+
+    const plain = await run(false)
+    const enveloped = await run(true)
+
+    expect(plain.result?.shadowedSeqs).toHaveLength(plain.maximalNodes)
+    expect(enveloped.result?.shadowedSeqs.length).toBeLessThan(enveloped.maximalNodes)
+    expect(enveloped.result?.shadowedSeqs.length).toBeLessThan(plain.result!.shadowedSeqs.length)
+    expect(enveloped.adapter.requests).toHaveLength(1)
+    expect(enveloped.adapter.requests[0]).toMatchObject({
+      system: expect.stringContaining('system'),
+      tools: [expect.objectContaining({ name: 'large_tool' })],
+      maxTokens: 64,
+    })
+    const dispatched = enveloped.adapter.requests[0]!
+    const summaryHeader = enveloped.ctx.tokenMeter.measure(enveloped.session, {
+      config: { provider: MODEL, model: MODEL, maxTokens: 64 },
+      ...dispatched.system === undefined ? {} : { system: dispatched.system },
+      ...dispatched.tools === undefined ? {} : { tools: dispatched.tools },
+    })
+    const fixedTokens = summaryHeader.totalTokens - summaryHeader.surfaceTokens
+    const dispatchedInputTokens = fixedTokens + dispatched.messages.reduce(
+      (total, message) => total + enveloped.ctx.tokenMeter.estimateMessage(message),
+      0,
+    )
+    expect(dispatchedInputTokens + 64).toBeLessThanOrEqual(1_800)
+    const nextNode = enveloped.measurement.nodes[enveloped.result!.shadowedSeqs.length]!
+    expect(dispatchedInputTokens + nextNode.tokens + 64).toBeGreaterThan(1_800)
+    expect(enveloped.session.events.filter(event => event.type === 'compaction/start').length)
+      .toBeGreaterThan(enveloped.adapter.requests.length)
+  })
+
+  it('chunks large-envelope pressure until the measured request falls below threshold', async () => {
+    const ctx = new Context()
+    void new LlmRuntime(ctx)
+    void new TokenMeter(ctx)
+    const adapter = new CapacitySummaryAdapter(1_800)
+    ctx.llm.registerAdapter([MODEL], adapter)
+    const compact = new BasicCompactionEngine(ctx, {
+      auto: false,
+      thresholdRatio: 0.8,
+      retainTokens: 0,
+      maxTokens: 64,
+      compactionRetries: 3,
+    })
+    const session = conversation(8, 'x'.repeat(400))
+    session.append('request/header', {
+      header: {
+        config: { provider: MODEL, model: MODEL },
+        system: 'system '.repeat(100),
+        tools: [{
+          name: 'large_tool',
+          description: 'description '.repeat(60),
+          parameters: { type: 'object', properties: { value: { type: 'string' } } },
+        }],
+      },
+      reason: 'resume',
+    })
+    const threshold = 1_440
+    expect(ctx.tokenMeter.measure(session).totalTokens).toBeGreaterThanOrEqual(threshold)
+
+    await expect(compactIfNeeded(compact, session, 'pressure')).resolves.not.toBeNull()
+
+    expect(adapter.requests.length).toBeGreaterThan(0)
+    expect(ctx.tokenMeter.measure(session).totalTokens).toBeLessThan(threshold)
+    expect(session.events.filter(event => event.type === 'compaction/summary'))
+      .toHaveLength(adapter.requests.length)
+  })
+
+  it('shrinks after provider context overflow and submits each range at most once', async () => {
+    const { adapter, compact } = capacityService(10_000, 3)
+    const session = conversation(6, 'x'.repeat(400))
+
+    await expect(compactIfNeeded(compact, session, 'context-overflow')).resolves.not.toBeNull()
+
+    const replayCounts = adapter.requests.map(request => request.messages.length - 1)
+    expect(replayCounts.length).toBeGreaterThan(1)
+    expect(replayCounts.at(-1)).toBeLessThanOrEqual(3)
+    expect(replayCounts.every((count, index) => index === 0 || count < replayCounts[index - 1]!))
+      .toBe(true)
+    expect(new Set(replayCounts).size).toBe(replayCounts.length)
+    expect(session.events.filter(event => event.type === 'compaction/summary')).toHaveLength(1)
+    expect(session.events.filter(event => event.type === 'compaction/start'))
+      .toHaveLength(adapter.requests.length)
+    expect(session.events.filter(event => event.type === 'compaction/end'))
+      .toHaveLength(adapter.requests.length)
+  })
+
+  it('caches provider-rejected ranges for one surface generation and terminates on the oldest unit', async () => {
+    const { adapter, compact } = capacityService(10_000, 0)
+    const session = conversation(4, 'x'.repeat(200))
+    const generation = session.surface.replaceGeneration
+    const originalSurface = [...session.surface.nodes]
+
+    let firstError: unknown
+    try {
+      await compactIfNeeded(compact, session, 'context-overflow')
+    } catch (error: unknown) {
+      firstError = error
+    }
+    expect(firstError).toBeInstanceOf(OversizedSurfaceUnitError)
+    expect(firstError).toMatchObject({
+      code: 'SUMMARY_SURFACE_UNIT_TOO_LARGE',
+      unit: expect.objectContaining({
+        start: session.surface.nodes[0],
+        tokens: expect.any(Number),
+      }),
+    })
+    const callsAfterFirstFailure = adapter.requests.length
+    expect(callsAfterFirstFailure).toBeGreaterThan(1)
+
+    await expect(compactIfNeeded(compact, session, 'context-overflow'))
+      .rejects.toBeInstanceOf(OversizedSurfaceUnitError)
+    expect(adapter.requests).toHaveLength(callsAfterFirstFailure)
+    expect(session.surface.replaceGeneration).toBe(generation)
+    expect(session.surface.nodes).toEqual(originalSurface)
+    expect(session.events.filter(event => event.type === 'compaction/summary')).toHaveLength(0)
+    expect(session.events.filter(event => event.type === 'compaction/start'))
+      .toHaveLength(callsAfterFirstFailure)
+    expect(session.events.filter(event => event.type === 'compaction/end'))
+      .toHaveLength(callsAfterFirstFailure)
+
+    const tail = session.surface.nodes.at(-1)!
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'advance capacity cache generation' }],
+      source: { kind: 'plugin', plugin: 'test' },
+    }), {
+      surfaceOp: { op: 'replace', start: tail, end: tail },
+      sourceEventSeqs: [tail],
+    })
+    await expect(compactIfNeeded(compact, session, 'context-overflow'))
+      .rejects.toBeInstanceOf(OversizedSurfaceUnitError)
+    expect(adapter.requests.length).toBeGreaterThan(callsAfterFirstFailure)
+  })
+
+  it('rejects one preflight-oversized surface unit without calling the model or mutating surface', async () => {
+    const { adapter, compact } = capacityService(1_000)
+    const session = conversation(1, 'x'.repeat(10_000))
+    const generation = session.surface.replaceGeneration
+    const originalSurface = [...session.surface.nodes]
+    const firstSeq = session.surface.nodes[0]!
+
+    await expect(compactIfNeeded(compact, session, 'context-overflow')).rejects.toMatchObject({
+      code: 'SUMMARY_SURFACE_UNIT_TOO_LARGE',
+      unit: { start: firstSeq, end: firstSeq, tokens: expect.any(Number) },
+      contextWindow: 1_000,
+      fixedEnvelopeTokens: expect.any(Number),
+      instructionTokens: expect.any(Number),
+      reservedOutputTokens: 64,
+    })
+    expect(adapter.requests).toHaveLength(0)
+    expect(session.surface.replaceGeneration).toBe(generation)
+    expect(session.surface.nodes).toEqual(originalSurface)
+    expect(session.events.filter(event => event.type === 'compaction/summary')).toHaveLength(0)
   })
 })
 

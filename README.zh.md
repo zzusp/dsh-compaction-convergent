@@ -25,10 +25,10 @@ Pull Request 和 `main` push 会在 GitHub Actions 的 Windows Node 24 环境执
 - **收敛**：拒绝不能缩小源内容的摘要，并在同一个成功替换槽位内按 `retainTokens`、`floor(retainTokens / 2)`、`0` 扩大范围。预算变化时重新计量和选区；重复 `start:end` 不重复调用摘要器。只有 `SummaryNotSmallerError` 触发扩张；成功替换后的 `compactionRetries` 语义保持官方行为。
 - **闭合步骤孤儿调用**：如果旧步骤已经持久化 `step/end`，但其中的工具调用从未落下结果，普通配对边界仍保持拒绝。只有在所有未回答调用都属于这种已闭合旧步骤、常规范围又不能缩小时，最终最大范围才会覆盖完整表层；摘要输入会紧邻这些调用插入仅用于本次摘要的错误结果，原 Session 日志不会被补写。当前仍在运行的开放步骤不会走这条路径。
 - **恢复边界**：provider 只能压缩当前 Session surface。DSH 恢复历史 Session 后追加的 `session/end-seed` 会建立新的恢复 surface；该边界之前的病理历史不能由在线自动压缩重新选中。此类 Session 必须在 Web 恢复前通过真实模型完成一次性 repair，确定性占位摘要脚本不能用于生产语义迁移。
-- **摘要**：直接 `llm/stream` 调用使用已配置的提供方／模型对与上限，回退到最新已记录请求目标，然后再回退到 agent（智能体）目标，而不运行仅用于 agent loop 的 `agent/request` 扩展点。该调用会逐字回放会话自身的系统提示词、工具与已遮蔽区域消息（包括图片引用），并将压缩指令作为最后一条 user 消息追加，从而复用提供方的热前缀 cache，而非使它失效。所选适配器必须解析或明确拒绝这些图片。它将 `GenerateOptions.purpose` 设为 `compaction`，适配器可将其作为请求归因转发（DeepSeek 适配器发送 `x-deepseek-harness-compact: 1`），但不会触碰模型可见的请求体。只有返回的文本会进入检查点；推理（reasoning）和工具调用都会被排除，以免泄露私有推理或产生遗留调用；图片输出会以 `UNSUPPORTED_CONTENT` 失败，而不是消失。
+- **摘要**：直接 `llm/stream` 调用使用已配置的提供方／模型对与上限，回退到最新已记录请求目标，然后再回退到 agent（智能体）目标，而不运行仅用于 agent loop 的 `agent/request` 扩展点。调用前，默认摘要器会按该模型声明的上下文窗口计量完整请求：system、tools、所选消息、尾随压缩指令以及 `maxTokens` 输出预留。该调用会逐字回放会话自身的系统提示词、工具与已遮蔽区域消息（包括图片引用），并将压缩指令作为最后一条 user 消息追加，从而复用提供方的热前缀 cache，而非使它失效。所选适配器必须解析或明确拒绝这些图片。它将 `GenerateOptions.purpose` 设为 `compaction`，适配器可将其作为请求归因转发（DeepSeek 适配器发送 `x-deepseek-harness-compact: 1`），但不会触碰模型可见的请求体。只有返回的文本会进入检查点；推理（reasoning）和工具调用都会被排除，以免泄露私有推理或产生遗留调用；图片输出会以 `UNSUPPORTED_CONTENT` 失败，而不是消失。
 - **框定**：替换 user 消息使用 `<compacted-summary>` 标签标记已建立的检查点上下文。原始摘要保留在 `compaction/summary` 事件上，后续自动周期会合并之前的检查点。
 - **生命周期**：所有入口点共享一个先记录标记的区域事务。它会验证范围与活动锁，同步追加 `compaction/start`，准备并等待摘要，重新验证，再追加 `compaction/summary` 和替换，最后恰好进行一次闭合尝试。自动调用和显式范围调用要求数字标识的开放轮次归属，并要求整个表层保持稳定；串行 `agent/pre-step` listener 会在派生请求之前检查压力，而规范提供方溢出则经由 `agent/request-error` 进入，并且只在表层取得持久进展后才允许重试。`compactNow()` 会预留空闲接纳，使用 `turn: null`，允许所选 span 之外追加仅追加上下文，flush 每次已闭合尝试，并在 `finally` 中释放接纳预留。
-- **溢出恢复**：提供方已确认的溢出不需容量元数据。它会绕过常规压力与保留，执行剪枝，再尝试一次最大平衡头部缩减，并留下最新不可分单元。只要 `surface.replaceGeneration` 前进，就允许重试，包括剪枝在后续摘要工作抛出异常前已落地的情况。如果没有替换、目标特定上限已耗尽、已取消，或遇到未知／非规范错误，则保留原始提供方失败。
+- **溢出恢复**：提供方已确认的溢出不需要容量元数据即可触发。它会绕过常规压力与保留，执行剪枝，再以最大平衡头部缩减为目标，并留下最新不可分单元。摘要模型声明容量时，若完整摘要 envelope 超窗，会在任何模型调用前改选容量内最大的平衡前缀。摘要侧规范化的 `CONTEXT_WINDOW_EXCEEDED` 会继续折半到更小且尚未尝试的平衡前缀；被拒绝的 `start:end` 在当前 `surface.replaceGeneration` 内保持熔断。若最老不可分单元仍无法提交，`OversizedSurfaceUnitError` 会报告其 seq 范围与 token/envelope 预算，而不是循环。只要 `surface.replaceGeneration` 前进，就允许重试，包括剪枝在后续摘要工作抛出异常前已落地的情况。如果没有替换、目标特定上限已耗尽、已取消，或遇到未知／非规范错误，则保留原始提供方失败。
 - **失败处理**：活动的未匹配 `compaction/start` 是持久锁。位于较新 `session/end-seed` 之前的未匹配标记，是先前生命周期留下的陈旧证据，不会阻塞；位于该边界之后的标记报告 `busy`。摘要和 span 变更失败会以错误闭合，并保持会话表层不变，但日志中仍保留该尝试。闭合失败会有意留下阻塞性的未匹配标记。压力检查中的运行故障会发出警告并继续；只有此前没有替换推进表层时，溢出恢复失败才保留原始提供方错误。完成清理与持久化后，取消仍具有最终决定权。
 
 受保护的 `summarize()` 方法是唯一的子类钩子。基于模板或远程摘要器的子类可以覆盖该方法，同时压力、保留、被引用的源事件、缩减验证与已遮蔽 token 计量仍由 `ctx.tokenMeter` 负责。钩子返回安全摘要，以及完整提供方输出、调用 envelope 和可用时的 usage（`{ summary, rawOutput?, llmStreamCall?, provider, model, maxTokens?, usage? }`）；`llmStreamCall: true` 表示生成该结果时恰好通过此上下文的 `ctx.llm.stream()` 发起了一次调用，且必须提供完整的 `rawOutput`；未带标记的 `rawOutput` 并不能判定调用路径。事务会在 `compaction/summary` 上保留这些字段。
@@ -159,7 +159,7 @@ Rules:
 
 #### Token 影响
 
-这是一次独立模型调用：输入是已回放会话前缀加固定指令，输出受 `maxTokens` 限制。除已闭合步骤的孤儿工具调用会在摘要输入中得到临时错误结果外，其余消息保持原样回放。收敛重试可能多次支付这项成本。
+这是一次独立模型调用：输入是已回放会话前缀加固定指令，输出受 `maxTokens` 限制。除已闭合步骤的孤儿工具调用会在摘要输入中得到临时错误结果外，其余消息保持原样回放。预检拒绝的范围不会调用模型；提供方拒绝的范围在同一 surface generation 内最多付费一次，随后只尝试更小的平衡前缀。
 
 #### KV Cache 影响
 
