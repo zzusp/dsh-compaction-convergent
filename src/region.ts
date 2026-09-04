@@ -38,6 +38,13 @@ interface SurfaceSelection {
   readonly shadowedSeqs: readonly number[]
 }
 
+/** The oldest head-anchored surface unit that may be summarized atomically. */
+export interface CompactableSurfaceUnit {
+  readonly start: number
+  readonly end: number
+  readonly tokens: number
+}
+
 /** A selection with its priced snapshot and the replay input built from it. */
 interface PreparedCompaction extends SurfaceSelection {
   readonly measurement: TokenMeasurement
@@ -122,12 +129,7 @@ export function selectCompactableRange(
 ): { start: number; end: number } | null {
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
-
-  const surfaceNodes = session.surface.nodes
-  if (surfaceNodes.length !== pricedNodes.length
-    || surfaceNodes.some((seq, index) => seq !== pricedNodes[index]?.seq)) {
-    throw new Error('compaction: token-meter surface does not match the current session surface')
-  }
+  const surfaceNodes = matchingSurfaceNodes(session, measurement)
 
   let accumulated = 0
   let keepFromIdx = pricedNodes.length
@@ -153,6 +155,63 @@ export function selectCompactableRange(
   return { start: first, end: cutoff }
 }
 
+/**
+ * Select the largest balanced head prefix under both a positional end and a
+ * message-token budget. This is the capacity fallback after a larger summary
+ * envelope is rejected; unlike retained-tail selection it never expands the
+ * requested range.
+ */
+export function selectLargestCompactablePrefix(
+  session: Session,
+  measurement: TokenMeasurement,
+  latestEnd: number,
+  maxTokens: number,
+): { start: number; end: number } | null {
+  const pricedNodes = measurement.nodes
+  if (pricedNodes.length === 0) return null
+  const surfaceNodes = matchingSurfaceNodes(session, measurement)
+  const latestEndIdx = surfaceNodes.indexOf(latestEnd)
+  if (latestEndIdx === -1) {
+    throw new Error(`compaction: capacity end seq ${latestEnd} not found in surface`)
+  }
+
+  const first = surfaceNodes[0]!
+  if (!toolPairingBalancedBefore(session, first)) return null
+  let tokens = 0
+  let selectedEnd: number | undefined
+  for (let index = 0; index <= latestEndIdx; index += 1) {
+    tokens += pricedNodes[index]!.tokens
+    if (tokens > maxTokens) break
+    const end = surfaceNodes[index]!
+    if (toolPairingBalancedAfter(session, end)) selectedEnd = end
+  }
+  return selectedEnd === undefined ? null : { start: first, end: selectedEnd }
+}
+
+/** Inspect the oldest indivisible balanced unit for a terminal capacity diagnostic. */
+export function oldestCompactableSurfaceUnit(
+  session: Session,
+  measurement: TokenMeasurement,
+  allowClosedStepOrphans = false,
+): CompactableSurfaceUnit | null {
+  const pricedNodes = measurement.nodes
+  if (pricedNodes.length === 0) return null
+  const surfaceNodes = matchingSurfaceNodes(session, measurement)
+  const first = surfaceNodes[0]!
+  if (!toolPairingBalancedBefore(session, first)) return null
+
+  let tokens = 0
+  for (let index = 0; index < surfaceNodes.length; index += 1) {
+    tokens += pricedNodes[index]!.tokens
+    const end = surfaceNodes[index]!
+    if (toolPairingBalancedAfter(session, end)) return { start: first, end, tokens }
+  }
+  if (allowClosedStepOrphans && hasOnlyClosedStepOrphans(session)) {
+    return { start: first, end: surfaceNodes.at(-1)!, tokens }
+  }
+  return null
+}
+
 /** Resolve the largest head-anchored range ending at the newest balanced boundary. */
 export function selectMaximalCompactableRange(
   session: Session,
@@ -160,12 +219,7 @@ export function selectMaximalCompactableRange(
 ): { start: number; end: number } | null {
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
-
-  const surfaceNodes = session.surface.nodes
-  if (surfaceNodes.length !== pricedNodes.length
-    || surfaceNodes.some((seq, index) => seq !== pricedNodes[index]?.seq)) {
-    throw new Error('compaction: token-meter surface does not match the current session surface')
-  }
+  const surfaceNodes = matchingSurfaceNodes(session, measurement)
 
   const first = surfaceNodes[0]!
   if (!toolPairingBalancedBefore(session, first)) return null
@@ -175,6 +229,19 @@ export function selectMaximalCompactableRange(
     if (toolPairingBalancedAfter(session, end)) return { start: first, end }
   }
   return null
+}
+
+/** Validate that positional token pricing belongs to the current surface. */
+function matchingSurfaceNodes(
+  session: Session,
+  measurement: TokenMeasurement,
+): readonly number[] {
+  const surfaceNodes = session.surface.nodes
+  if (surfaceNodes.length !== measurement.nodes.length
+    || surfaceNodes.some((seq, index) => seq !== measurement.nodes[index]?.seq)) {
+    throw new Error('compaction: token-meter surface does not match the current session surface')
+  }
+  return surfaceNodes
 }
 
 /** Return terminal tool calls that cannot receive a result because their owning step is closed. */

@@ -1,0 +1,15 @@
+case,round-1
+full-envelope-preflight,PASS
+largest-balanced-prefix,PASS
+pressure-converges-below-threshold,PASS
+provider-overflow-range-reduction,PASS
+same-generation-range-dedup,PASS
+generation-advance-cache-reset,PASS
+oversized-unit-diagnostic,PASS
+failed-attempt-surface-immutability,PASS
+real-loop-original-request-retry,PASS
+existing-compaction-regressions,PASS
+typescript-typecheck,PASS
+coverage-gate,PASS
+package-build,PASS
+package-dry-run-contents,PASS

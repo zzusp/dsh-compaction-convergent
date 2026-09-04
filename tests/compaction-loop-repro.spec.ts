@@ -82,6 +82,7 @@ class OverflowRecoveryAdapter extends LlmAdapter {
   constructor(
     private readonly delivery: 'thrown' | 'in-band',
     private readonly transientAfterOverflow = false,
+    private readonly maximumSummaryReplayMessages = Number.POSITIVE_INFINITY,
   ) {
     super()
   }
@@ -91,7 +92,9 @@ class OverflowRecoveryAdapter extends LlmAdapter {
       provider,
       id: model,
       name: model,
-      context: { contextWindow: 128 },
+      // The adapter injects the conversation overflow deterministically; keep
+      // enough real capacity for the compaction instruction and checkpoint.
+      context: { contextWindow: 4_096 },
     })
   }
 
@@ -107,6 +110,19 @@ class OverflowRecoveryAdapter extends LlmAdapter {
       .join('') ?? ''
     if (trailing.includes('acting as a compaction engine')) {
       this.summaryRequests.push(options)
+      if (options.messages.length - 1 > this.maximumSummaryReplayMessages) {
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: {
+              message: 'summary input exceeds the context window of this model',
+              code: CONTEXT_WINDOW_EXCEEDED_CODE,
+            },
+          },
+        }
+        return
+      }
       yield { type: 'block-start', index: 0, blockType: 'text' }
       yield { type: 'block-end', index: 0, block: { type: 'text', text: 'RECOVERY CHECKPOINT' } }
       yield { type: 'finish', reason: { kind: 'stop' } }
@@ -384,6 +400,51 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
       }
     },
   )
+
+  it('shrinks a summary-side overflow before rebuilding the original model request', async () => {
+    const ctx = new Context()
+    const adapter = new OverflowRecoveryAdapter('thrown', false, 2)
+    await mountAgentLoopTestDependencies(ctx)
+    await mountInvariants(ctx)
+    await ctx.plugin(AgentLoop, { agents: [] })
+    await ctx.plugin(TokenMeter)
+    ctx.llm.registerAdapter(['mock'], adapter)
+    await ctx.plugin(BasicCompactionEngine, {
+      thresholdRatio: 1,
+      retainTokens: 100,
+      maxTokens: 64,
+      compactionRetries: 0,
+      maxOverflowRetries: 1,
+    })
+
+    try {
+      const { agent } = await ctx.agentLoop.createAgent(ctx, {
+        sessionId: SessionId('summary-overflow-recovery'),
+        seed: overflowHistorySeed(),
+        agentOptions: { provider: 'mock', model: 'mock' },
+      })
+      agent.followup(createUserMessage({
+        content: [{ type: 'text', text: 'continue after summary range reduction' }],
+        source: { kind: 'user' },
+      }))
+      await agent.whenIdle()
+
+      expect(adapter.conversationRequests).toHaveLength(2)
+      const replayCounts = adapter.summaryRequests.map(request => request.messages.length - 1)
+      expect(replayCounts.length).toBeGreaterThan(1)
+      expect(replayCounts.at(-1)).toBeLessThanOrEqual(2)
+      expect(new Set(replayCounts).size).toBe(replayCounts.length)
+      const retry = JSON.stringify(adapter.conversationRequests[1]!.messages)
+      expect(retry).toContain('RECOVERY CHECKPOINT')
+      expect(retry).not.toContain('OLD HISTORY SENTINEL')
+      expect(agent.session.events.at(-1)).toMatchObject({
+        type: 'turn/end',
+        data: { reason: { kind: 'completed' } },
+      })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
 
   it('keeps context-overflow and transient retry budgets independent in one sequence', async () => {
     const ctx = new Context()
