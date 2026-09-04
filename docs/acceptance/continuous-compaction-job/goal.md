@@ -12,7 +12,7 @@
 | SG2 容量学习 | 完成 | 成功/拒绝上下界按 envelope key 复用，generation 不清空，key 变化失效 |
 | SG3 可恢复诊断 | 完成 | 日志可重建 jobId、chunk/attempt、失败范围与容量 profile |
 | SG4 有限终止 | 完成 | 取消、超大单元、不缩小、重复范围、无进展和未知错误均不死循环 |
-| SG5 回归与交付 | 进行中 | 全量测试、coverage、build、pack 通过并创建 PR |
+| SG5 回归与交付 | 完成 | 全量测试、coverage、build、pack 通过并创建 PR |
 
 ## 重大决策
 
@@ -27,4 +27,4 @@
 
 ## Sub goal 进展
 
-- Round 1：实现连续作业、容量 profile、持久诊断与逐块 flush；确定性回归和全量验证通过。待完成 Git 提交、push 与 PR 状态回查。
+- Round 1：实现连续作业、容量 profile、持久诊断与逐块 flush；确定性回归和全量验证通过。已提交并推送，PR #8 回查为 OPEN、MERGEABLE。
