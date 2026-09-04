@@ -8,7 +8,7 @@ This package is derived from DeepSeek Harness commit `b150a551b8d465e31e418e1b2e
 
 ## Build and release
 
-Pull requests and pushes to `main` run locked installation, typechecking, 100% coverage tests, build, and `npm pack` on Windows with Node 24. The workflow artifact is named with the complete source SHA. Pushing a `v<version>` tag that exactly matches `package.json` publishes that same package to a GitHub Release together with its SHA-256 file and `provenance.json`.
+Only pushing a `v<version>` tag that exactly matches `package.json` triggers GitHub Actions. The workflow runs locked installation, typechecking, 100% coverage tests, build, and `npm pack` on Windows with Node 24, then publishes the package named with the complete source SHA to a GitHub Release together with its SHA-256 file and `provenance.json`. Pull requests and pushes to `main` do not trigger this workflow.
 
 See [Replacing the official compaction plugin](docs/manual/replace-official-plugin.md) for the exact profile patch, verification, and rollback procedure (Chinese).
 
