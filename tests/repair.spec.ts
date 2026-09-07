@@ -7,6 +7,7 @@ import LlmRuntime, { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
+import { installTokenMeter } from './setup.ts'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BasicCompactionEngine } from '../src/index.ts'
 import type { SummarizationInput, SummaryResult } from '../src/summarizer.ts'
@@ -65,14 +66,14 @@ function persistedFixture(): { raw: string; sessionId: string } {
   }
   return {
     sessionId,
-    raw: [JSON.stringify(session.header), ...session.events.map(event => JSON.stringify(event)), ''].join('\n'),
+    raw: [JSON.stringify(session.header), ...session.snapshotEvents().map(event => JSON.stringify(event)), ''].join('\n'),
   }
 }
 
 async function repairContext(): Promise<Context> {
   const ctx = new Context()
   void new LlmRuntime(ctx)
-  void new TokenMeter(ctx)
+  void installTokenMeter(ctx)
   ctx.llm.registerAdapter(['repair-provider'], new RepairAdapter())
   void new RepairEngine(ctx, { auto: false, thresholdRatio: 0.5, retainRatio: 0.1 })
   return ctx

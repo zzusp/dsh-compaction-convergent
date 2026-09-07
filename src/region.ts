@@ -24,6 +24,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { Message, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { TokenMeasurement, TokenMeter } from '@deepseek-ai/dsh-token-meter'
+import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { frameSummary, SummaryInputTooLargeError } from './summarizer.ts'
@@ -38,17 +39,17 @@ interface RegionDependencies {
 
 /** One validated inclusive span of current surface positions. */
 interface SurfaceSelection {
-  readonly start: number
-  readonly end: number
+  readonly start: SessionSeq
+  readonly end: SessionSeq
   readonly startIdx: number
   readonly endIdx: number
-  readonly shadowedSeqs: readonly number[]
+  readonly shadowedSeqs: readonly SessionSeq[]
 }
 
 /** The oldest head-anchored surface unit that may be summarized atomically. */
 export interface CompactableSurfaceUnit {
-  readonly start: number
-  readonly end: number
+  readonly start: SessionSeq
+  readonly end: SessionSeq
   readonly tokens: number
 }
 
@@ -83,7 +84,7 @@ interface CompactionTransactionOptions {
 interface CompactionEntryState {
   readonly openTurn: number | null
   readonly unmatchedCompactionStart: SessionEvent<'compaction/start'> | undefined
-  readonly latestEndSeedSeq: number | undefined
+  readonly latestEndSeedSeq: SessionSeq | undefined
 }
 
 /**
@@ -136,7 +137,7 @@ export function selectCompactableRange(
   session: Session,
   measurement: TokenMeasurement,
   retainTokens: number,
-): { start: number; end: number } | null {
+): { start: SessionSeq; end: SessionSeq } | null {
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
   const surfaceNodes = matchingSurfaceNodes(session, measurement)
@@ -174,9 +175,9 @@ export function selectCompactableRange(
 export function selectLargestCompactablePrefix(
   session: Session,
   measurement: TokenMeasurement,
-  latestEnd: number,
+  latestEnd: SessionSeq,
   maxTokens: number,
-): { start: number; end: number } | null {
+): { start: SessionSeq; end: SessionSeq } | null {
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
   const surfaceNodes = matchingSurfaceNodes(session, measurement)
@@ -188,7 +189,7 @@ export function selectLargestCompactablePrefix(
   const first = surfaceNodes[0]!
   if (!toolPairingBalancedBefore(session, first)) return null
   let tokens = 0
-  let selectedEnd: number | undefined
+  let selectedEnd: SessionSeq | undefined
   for (let index = 0; index <= latestEndIdx; index += 1) {
     tokens += pricedNodes[index]!.tokens
     if (tokens > maxTokens) break
@@ -226,7 +227,7 @@ export function oldestCompactableSurfaceUnit(
 export function selectMaximalCompactableRange(
   session: Session,
   measurement: TokenMeasurement,
-): { start: number; end: number } | null {
+): { start: SessionSeq; end: SessionSeq } | null {
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
   const surfaceNodes = matchingSurfaceNodes(session, measurement)
@@ -245,7 +246,7 @@ export function selectMaximalCompactableRange(
 function matchingSurfaceNodes(
   session: Session,
   measurement: TokenMeasurement,
-): readonly number[] {
+): readonly SessionSeq[] {
   const surfaceNodes = session.surface.nodes
   if (surfaceNodes.length !== measurement.nodes.length
     || surfaceNodes.some((seq, index) => seq !== measurement.nodes[index]?.seq)) {
@@ -258,11 +259,12 @@ function matchingSurfaceNodes(
 function closedStepOrphanIds(session: Session): Set<string> | null {
   const pending = new Map<string, SessionEvent<'assistant/message'>>()
   const closedSteps = new Map<string, number>()
-  for (const event of session.events) {
+  const events = session.snapshotEvents()
+  for (const event of events) {
     if (event.type === 'step/end') closedSteps.set(`${event.data.turn}:${event.data.step}`, event.seq)
   }
   for (const seq of session.surface.nodes) {
-    const event = session.events[seq]!
+    const event = events[seq]!
     if (event.type === 'assistant/message') {
       for (const block of event.data.message.content) {
         if (block.type === 'tool-call') pending.set(block.id, event)
@@ -311,7 +313,7 @@ export async function compactSurfaceRegion(
 ): Promise<CompactionResult> {
   if (options.owner === null) signal?.throwIfAborted()
   const selection = validateSurfaceRegion(session, start, end, options.allowClosedStepOrphans === true)
-  const entryState = inspectCompactionEntryState(session.events)
+  const entryState = inspectCompactionEntryState(session.snapshotEvents())
   assertCompactionInactive(
     entryState.unmatchedCompactionStart,
     entryState.latestEndSeedSeq,
@@ -475,7 +477,7 @@ function assertCompactionInactive(
  * @param stage - operation label included in the busy diagnostic.
  */
 export function assertNoActiveCompaction(session: Session, stage: string): void {
-  const entryState = inspectCompactionEntryState(session.events)
+  const entryState = inspectCompactionEntryState(session.snapshotEvents())
   assertCompactionInactive(
     entryState.unmatchedCompactionStart,
     entryState.latestEndSeedSeq,
@@ -491,8 +493,8 @@ function validateSurfaceRegion(
   allowClosedStepOrphans = false,
 ): SurfaceSelection {
   const nodes = session.surface.nodes
-  const startIdx = nodes.indexOf(start)
-  const endIdx = nodes.indexOf(end)
+  const startIdx = nodes.indexOf(SessionSeq(start))
+  const endIdx = nodes.indexOf(SessionSeq(end))
   if (startIdx === -1) throw new Error(`compactRegion: start seq ${start} not found in surface`)
   if (endIdx === -1) throw new Error(`compactRegion: end seq ${end} not found in surface`)
   if (startIdx > endIdx) {
@@ -510,7 +512,7 @@ function validateSurfaceRegion(
     throw new Error(`compactRegion: end seq ${end} is not a balanced boundary (would split a step, or the step is still open)`)
   }
 
-  return { start, end, startIdx, endIdx, shadowedSeqs: nodes.slice(startIdx, endIdx + 1) }
+  return { start: SessionSeq(start), end: SessionSeq(end), startIdx, endIdx, shadowedSeqs: nodes.slice(startIdx, endIdx + 1) }
 }
 
 /** Snapshot pricing and replay input for a validated surface range. */
@@ -819,11 +821,11 @@ function completeCompaction(
  */
 function buildSummarizationInput(
   session: Session,
-  shadowedSeqs: readonly number[],
+  shadowedSeqs: readonly SessionSeq[],
   repairClosedStepOrphans = false,
 ): SummarizationInput {
   const header = session.requestHeader()
-  const events = session.events
+  const events = session.snapshotEvents()
   const orphanIds = repairClosedStepOrphans ? closedStepOrphanIds(session) : null
   const regionMessages = shadowedSeqs
     // shadowedSeqs are current surface seqs, so each is a valid log index.
@@ -856,7 +858,7 @@ function inspectCompactionEntryState(events: readonly SessionEvent[]): Compactio
   let openTurnStateKnown = false
   let unmatchedCompactionStart: SessionEvent<'compaction/start'> | undefined
   let compactionEntryStateKnown = false
-  let latestEndSeedSeq: number | undefined
+  let latestEndSeedSeq: SessionSeq | undefined
   for (let index = events.length - 1; index >= 0; index -= 1) {
     // oxlint-disable-next-line typescript/no-non-null-assertion
     const event = events[index]!
