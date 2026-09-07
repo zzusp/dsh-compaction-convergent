@@ -160,7 +160,7 @@ export async function repairSessionCopy(ctx: Context, config: RepairConfig): Pro
   if (tokensAfter >= tokensBefore) {
     throw new Error(`repair replacement did not shrink the Session (${tokensBefore} -> ${tokensAfter})`)
   }
-  const output = [JSON.stringify(persisted.header), ...session.events.map(event => JSON.stringify(event)), ''].join('\n')
+  const output = [JSON.stringify(persisted.header), ...session.snapshotEvents().map(event => JSON.stringify(event)), ''].join('\n')
   await atomicCreate(outputPath, output)
 
   const reloaded = parseSession(await readFile(outputPath, 'utf8'))
@@ -176,7 +176,7 @@ export async function repairSessionCopy(ctx: Context, config: RepairConfig): Pro
     sourceSha256,
     sessionId: config.expectedSessionId,
     inputEvents: persisted.events.length,
-    outputEvents: session.events.length,
+    outputEvents: session.seq,
     tokensBefore,
     tokensAfter,
     shadowedNodes: result.shadowedSeqs.length,

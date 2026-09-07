@@ -4,6 +4,8 @@
 
 **收敛式压缩（compaction）后端**：可直接替换 `@deepseek-ai/dsh-compaction-basic`。它保留官方 `BasicCompactionEngine` 的事务和服务契约，并让一次自动触发在有限安全条件下持续分块到压力阈值以下。
 
+`0.1.2-rc.1-convergent.*` 发行线要求整套 DSH 包为 `0.1.2-rc.1`、Cordis 为 `4.0.2`，不能与 DSH `0.1.1-rc.2` 混装。
+
 本包基于 DeepSeek Harness 提交 `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`，遵循 MIT 许可；来源见 [NOTICE.md](NOTICE.md)。
 
 ## 构建与发布

@@ -20,7 +20,7 @@ import {
   resolveTargetPolicy,
 } from '@deepseek-ai/dsh-compaction-basic/src/config.ts'
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
-import LlmRuntime, { createUserMessage, CallId, CONTEXT_WINDOW_EXCEEDED_CODE, createToolResultMessage, LlmAdapter , createMessage } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, ToolCallId as CallId, CONTEXT_WINDOW_EXCEEDED_CODE, createToolResultMessage, LlmAdapter , createMessage } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   GenerateOptions,
@@ -30,8 +30,10 @@ import type {
   StreamChunk,
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
-import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { Session, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import { installTokenMeter } from './setup.ts'
 import { agentEvents, type Agent, type RequestErrorAction } from '@deepseek-ai/dsh-agent'
 import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner'
 
@@ -80,7 +82,7 @@ class RoutedContextAdapter extends LlmAdapter {
 function createContext(contextWindow = 1_000): Context {
   const ctx = new Context()
   void new LlmRuntime(ctx)
-  void new TokenMeter(ctx)
+  void installTokenMeter(ctx)
   ctx.llm.registerAdapter([MODEL, 'actual', 'unlisted-provider'], new ContextAdapter(contextWindow))
   return ctx
 }
@@ -526,7 +528,7 @@ describe('pressure measurement and retention', () => {
   it('re-resolves capacity after a same-model-id provider switch in one session', async () => {
     const ctx = new Context()
     void new LlmRuntime(ctx)
-    void new TokenMeter(ctx)
+    void installTokenMeter(ctx)
     ctx.llm.registerAdapter(['large', 'small'], new RoutedContextAdapter({
       large: 10_000,
       small: 1_000,
@@ -553,7 +555,7 @@ describe('pressure measurement and retention', () => {
   it('requires capacity only for proactive pressure, not provider-confirmed overflow', async () => {
     const ctx = new Context()
     void new LlmRuntime(ctx)
-    void new TokenMeter(ctx)
+    void installTokenMeter(ctx)
     ctx.llm.registerAdapter(['unknown-context'], new ContextAdapter(1_000))
     vi.spyOn(ctx.llm, 'resolveModelInfo').mockImplementation((provider, model) => Promise.resolve({
       provider,
@@ -610,7 +612,7 @@ describe('pressure measurement and retention', () => {
 
     await expect(compactIfNeeded(compact, session, 'context-overflow')).resolves.toBeNull()
     expect(session.surface.replaceGeneration).toBe(generation)
-    expect(session.events.some(event => event.type === 'compaction/start')).toBe(false)
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/start')).toBe(false)
   })
 
   it('does nothing below threshold and compacts a priced head above threshold', async () => {
@@ -727,7 +729,7 @@ describe('pressure measurement and retention', () => {
     expect(compact.calls[1]!.input.messages.length)
       .toBeGreaterThan(compact.calls[0]!.input.messages.length)
     expect(session.surface.replaceGeneration).toBe(generation + 1)
-    expect(session.events.filter(event => event.type === 'compaction/summary')).toHaveLength(1)
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/summary')).toHaveLength(1)
   })
 
   it('tries each distinct retained and maximal range only once', async () => {
@@ -803,12 +805,12 @@ describe('pressure measurement and retention', () => {
     const session = conversation(4)
     const fake: CompactionResult = {
       compactionId: CompactionId('no-progress'),
-      startSeq: 0,
-      summarySeq: 0,
-      endSeq: 0,
+      startSeq: SessionSeq(0),
+      summarySeq: SessionSeq(0),
+      endSeq: SessionSeq(0),
       summary: [{ type: 'text', text: 'fake' }],
-      shadowedRange: { start: 1, end: 2 },
-      shadowedSeqs: [1, 2],
+      shadowedRange: { start: SessionSeq(1), end: SessionSeq(2) },
+      shadowedSeqs: [SessionSeq(1), SessionSeq(2)],
       shadowedTokenCount: 1,
     }
     const region = vi.spyOn(compact, 'compactRegion').mockResolvedValue(fake)
@@ -913,7 +915,7 @@ describe('pressure measurement and retention', () => {
     )).resolves.toMatchObject({ shadowedSeqs: nodes })
     expect(compact.calls[0]!.input.messages.some(message => message.content.some(block =>
       block.type === 'tool-result' && block.toolCallId === callId))).toBe(true)
-    expect(session.events.some(event => event.type === 'tool/result')).toBe(false)
+    expect(session.snapshotEvents().some(event => event.type === 'tool/result')).toBe(false)
   })
 
   it('declines when rounding a cut would consume the only tool pair', () => {
@@ -1020,10 +1022,10 @@ describe('optional model-free tool-result pruning', () => {
 
     expect(await compactIfNeeded(compact, session)).not.toBeNull()
     expect(compact.calls).toHaveLength(1)
-    const original = session.events.find(event => event.type === 'tool/result')
+    const original = session.snapshotEvents().find(event => event.type === 'tool/result')
     expect(original?.type === 'tool/result' && original.data.message.content[0].content[0])
       .toEqual({ type: 'text', text: 'X'.repeat(3_000) })
-    expect(session.events.filter(event =>
+    expect(session.snapshotEvents().filter(event =>
       event.type === 'tool/result' && event.surfaceOp !== 'append')).toHaveLength(0)
   })
 })
@@ -1049,7 +1051,7 @@ describe('compaction region transaction', () => {
     expect(result.shadowedTokenCount).toBeGreaterThan(0)
     expect(compact.calls[0]).toMatchObject({ signal: SIGNAL })
     expect(summarizedText(compact.calls[0]!.input)).toContain('fixture user 1')
-    const summary = session.events.findLast(event => event.type === 'compaction/summary')
+    const summary = session.snapshotEvents().findLast(event => event.type === 'compaction/summary')
     expect(summary?.data).toMatchObject({
       shadowedSeqs: result.shadowedSeqs,
       shadowedTokenCount: result.shadowedTokenCount,
@@ -1065,7 +1067,7 @@ describe('compaction region transaction', () => {
     expect(head.content[0]?.type === 'text' ? head.content[0].text : '').toContain('<compacted-summary>')
     expect(head.content.at(-1)).toEqual({ type: 'text', text: '</compacted-summary>' })
 
-    const replay = Session.create(SessionId('replay'), [...session.events])
+    const replay = Session.create(SessionId('replay'), [...session.snapshotEvents()])
     expect(replay.deriveMessages()).toEqual(session.deriveMessages())
   })
 
@@ -1195,7 +1197,7 @@ describe('compaction region transaction', () => {
       agent(session, MODEL),
     )).rejects.toThrow('summary unavailable')
     expect(session.surface.nodes).toEqual(before)
-    expect(session.events.findLast(event => event.type === 'compaction/end')?.data)
+    expect(session.snapshotEvents().findLast(event => event.type === 'compaction/end')?.data)
       .toMatchObject({ error: 'summary unavailable' })
   })
 
@@ -1209,7 +1211,7 @@ describe('compaction region transaction', () => {
       nodes[2]!,
       agent(session, MODEL),
     )).rejects.toBe('plain failure')
-    expect(session.events.findLast(event => event.type === 'compaction/end')?.data)
+    expect(session.snapshotEvents().findLast(event => event.type === 'compaction/end')?.data)
       .toMatchObject({ error: 'plain failure' })
   })
 
@@ -1229,7 +1231,7 @@ describe('compaction region transaction', () => {
       nodes[2]!,
       agent(session, MODEL),
     )).resolves.toMatchObject({ shadowedSeqs: nodes.slice(0, 3) })
-    expect(session.events.some(event => event.type === 'compaction/summary')).toBe(true)
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/summary')).toBe(true)
   })
 
   it('rejects concurrent surface appends before committing the replacement', async () => {
@@ -1248,7 +1250,7 @@ describe('compaction region transaction', () => {
       nodes[2]!,
       agent(session, MODEL),
     )).rejects.toThrow(/session surface changed/)
-    expect(session.events.some(event => event.type === 'compaction/summary')).toBe(false)
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/summary')).toBe(false)
   })
 
   it('rejects a non-shrinking framed summary under the conversation meter', async () => {
@@ -1267,7 +1269,7 @@ describe('compaction region transaction', () => {
     )
     await expect(failure).rejects.toBeInstanceOf(SummaryNotSmallerError)
     await expect(failure).rejects.toThrow(/summary is not smaller/)
-    expect(session.events.some(event => event.type === 'compaction/summary')).toBe(false)
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/summary')).toBe(false)
   })
 
   it('lets a model-independent custom summarizer compact without a conversation model', async () => {
@@ -1395,7 +1397,7 @@ async function summarizerHarness(
 ): Promise<{ ctx: Context; adapter: ScriptedAdapter; compact: ExposedCompactionEngine }> {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
-  void new TokenMeter(ctx)
+  void installTokenMeter(ctx)
   const adapter = new ScriptedAdapter(blocks, finish)
   ctx.llm.registerAdapter([model], adapter)
   const compact = new ExposedCompactionEngine(ctx, config)
@@ -1565,7 +1567,7 @@ describe('default one-shot summarizer', () => {
     const session = conversation(3, 'large history '.repeat(500))
     const nodes = session.surface.nodes
     await compact.compactRegion(nodes[0]!, nodes[3]!, agent(session, MODEL), SIGNAL)
-    expect(session.events.findLast(event => event.type === 'compaction/summary')?.data).toMatchObject({
+    expect(session.snapshotEvents().findLast(event => event.type === 'compaction/summary')?.data).toMatchObject({
       summary: [{ type: 'text', text: 'routed summary' }],
       llmStreamCall: true,
       provider: 'routed-summary-provider',
@@ -1578,7 +1580,7 @@ describe('default one-shot summarizer', () => {
   it('fails clearly when no complete summarization target can be resolved', async () => {
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)
-    void new TokenMeter(ctx)
+    void installTokenMeter(ctx)
     const compact = new ExposedCompactionEngine(ctx, { auto: false })
     await expect(compact.runSummarize(promptInput('history'), agent(Session.create(SessionId('model-less')))))
       .rejects.toThrow(/no provider\/model available for summarization/)
@@ -1681,7 +1683,7 @@ describe('summary input capacity convergence', () => {
   ): { ctx: Context; adapter: CapacitySummaryAdapter; compact: BasicCompactionEngine } {
     const ctx = new Context()
     void new LlmRuntime(ctx)
-    void new TokenMeter(ctx)
+    void installTokenMeter(ctx)
     const adapter = new CapacitySummaryAdapter(contextWindow, maximumReplayMessages)
     ctx.llm.registerAdapter([MODEL], adapter)
     const compact = new BasicCompactionEngine(ctx, {
@@ -1744,14 +1746,14 @@ describe('summary input capacity convergence', () => {
     expect(dispatchedInputTokens + 64).toBeLessThanOrEqual(1_800)
     const nextNode = enveloped.measurement.nodes[enveloped.result!.shadowedSeqs.length]!
     expect(dispatchedInputTokens + nextNode.tokens + 64).toBeGreaterThan(1_800)
-    expect(enveloped.session.events.filter(event => event.type === 'compaction/start').length)
+    expect(enveloped.session.snapshotEvents().filter(event => event.type === 'compaction/start').length)
       .toBeGreaterThan(enveloped.adapter.requests.length)
   })
 
   it('chunks large-envelope pressure until the measured request falls below threshold', async () => {
     const ctx = new Context()
     void new LlmRuntime(ctx)
-    void new TokenMeter(ctx)
+    void installTokenMeter(ctx)
     const adapter = new CapacitySummaryAdapter(1_800)
     ctx.llm.registerAdapter([MODEL], adapter)
     const compact = new BasicCompactionEngine(ctx, {
@@ -1781,14 +1783,14 @@ describe('summary input capacity convergence', () => {
 
     expect(adapter.requests.length).toBeGreaterThan(0)
     expect(ctx.tokenMeter.measure(session).totalTokens).toBeLessThan(threshold)
-    expect(session.events.filter(event => event.type === 'compaction/summary'))
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/summary'))
       .toHaveLength(adapter.requests.length)
   })
 
   it('finishes a large surface in one job beyond the legacy successful-chunk cap', async () => {
     const ctx = new Context()
     void new LlmRuntime(ctx)
-    void new TokenMeter(ctx)
+    void installTokenMeter(ctx)
     const adapter = new CapacitySummaryAdapter(10_000, 4)
     ctx.llm.registerAdapter([MODEL], adapter)
     const compact = new BasicCompactionEngine(ctx, {
@@ -1804,7 +1806,7 @@ describe('summary input capacity convergence', () => {
 
     await expect(compactIfNeeded(compact, session, 'pressure')).resolves.not.toBeNull()
 
-    const records = session.events.flatMap(event => {
+    const records = session.snapshotEvents().flatMap(event => {
       const record = convergenceRecord(event)
       return record === undefined ? [] : [record]
     })
@@ -1858,7 +1860,7 @@ describe('summary input capacity convergence', () => {
     expect(successes.at(-1)?.requestTokensAfter).toBe(finalMeasurement.totalTokens)
     expect(successes.at(-1)?.surfaceTokensAfter).toBe(finalMeasurement.surfaceTokens)
 
-    const lifecycles = session.events.filter(event => (
+    const lifecycles = session.snapshotEvents().filter(event => (
       event.type === 'compaction/start'
       || event.type === 'compaction/summary'
       || event.type === 'compaction/end'
@@ -1876,7 +1878,7 @@ describe('summary input capacity convergence', () => {
   it('restores an unfinished job and learned capacity from durable compaction events', async () => {
     const firstCtx = new Context()
     void new LlmRuntime(firstCtx)
-    void new TokenMeter(firstCtx)
+    void installTokenMeter(firstCtx)
     const controller = new AbortController()
     const firstAdapter = new CapacitySummaryAdapter(10_000, 4, () => controller.abort('restart'))
     firstCtx.llm.registerAdapter([MODEL], firstAdapter)
@@ -1894,7 +1896,7 @@ describe('summary input capacity convergence', () => {
       'pressure',
       controller.signal,
     )).rejects.toBeDefined()
-    const firstRecords = original.events.flatMap(event => {
+    const firstRecords = original.snapshotEvents().flatMap(event => {
       const record = convergenceRecord(event)
       return record === undefined ? [] : [record]
     })
@@ -1902,10 +1904,10 @@ describe('summary input capacity convergence', () => {
     expect(firstSuccess.willContinueJob).toBe(true)
     const originalProbe = firstAdapter.requests[0]!.messages.length - 1
 
-    const resumed = Session.create(SessionId('capacity-job-resumed'), [...original.events])
+    const resumed = Session.create(SessionId('capacity-job-resumed'), [...original.snapshotEvents()])
     const secondCtx = new Context()
     void new LlmRuntime(secondCtx)
-    void new TokenMeter(secondCtx)
+    void installTokenMeter(secondCtx)
     const secondAdapter = new CapacitySummaryAdapter(10_000, 4)
     secondCtx.llm.registerAdapter([MODEL], secondAdapter)
     const secondEngine = new BasicCompactionEngine(secondCtx, {
@@ -1918,7 +1920,7 @@ describe('summary input capacity convergence', () => {
 
     await expect(compactIfNeeded(secondEngine, resumed, 'pressure')).resolves.not.toBeNull()
 
-    const allRecords = resumed.events.flatMap(event => {
+    const allRecords = resumed.snapshotEvents().flatMap(event => {
       const record = convergenceRecord(event)
       return record === undefined ? [] : [record]
     })
@@ -2002,10 +2004,10 @@ describe('summary input capacity convergence', () => {
     expect(replayCounts.every((count, index) => index === 0 || count < replayCounts[index - 1]!))
       .toBe(true)
     expect(new Set(replayCounts).size).toBe(replayCounts.length)
-    expect(session.events.filter(event => event.type === 'compaction/summary')).toHaveLength(1)
-    expect(session.events.filter(event => event.type === 'compaction/start'))
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/summary')).toHaveLength(1)
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/start'))
       .toHaveLength(adapter.requests.length)
-    expect(session.events.filter(event => event.type === 'compaction/end'))
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/end'))
       .toHaveLength(adapter.requests.length)
   })
 
@@ -2037,10 +2039,10 @@ describe('summary input capacity convergence', () => {
     expect(adapter.requests).toHaveLength(callsAfterFirstFailure)
     expect(session.surface.replaceGeneration).toBe(generation)
     expect(session.surface.nodes).toEqual(originalSurface)
-    expect(session.events.filter(event => event.type === 'compaction/summary')).toHaveLength(0)
-    expect(session.events.filter(event => event.type === 'compaction/start'))
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/summary')).toHaveLength(0)
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/start'))
       .toHaveLength(callsAfterFirstFailure)
-    expect(session.events.filter(event => event.type === 'compaction/end'))
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/end'))
       .toHaveLength(callsAfterFirstFailure)
 
     const tail = session.surface.nodes.at(-1)!
@@ -2074,7 +2076,7 @@ describe('summary input capacity convergence', () => {
     expect(adapter.requests).toHaveLength(0)
     expect(session.surface.replaceGeneration).toBe(generation)
     expect(session.surface.nodes).toEqual(originalSurface)
-    expect(session.events.filter(event => event.type === 'compaction/summary')).toHaveLength(0)
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/summary')).toHaveLength(0)
   })
 })
 
@@ -2094,7 +2096,7 @@ describe('automatic listener and loader composition', () => {
     next: () => Promise<RequestErrorAction> = () => Promise.resolve(undefined),
   ): Promise<boolean> {
     const failure: LlmFailure = { message: error.message, code: error.code ?? 'UNKNOWN' }
-    const turn = owner.session.events.findLast(event => event.type === 'turn/start')?.data.turn ?? 1
+    const turn = owner.session.snapshotEvents().findLast(event => event.type === 'turn/start')?.data.turn ?? 1
     return agentEvents(ctx, owner).waterfall(
       'agent/request-error',
       { turn, step: 1, provider: 'test', failure, retryPolicy: undefined, signal },
@@ -2114,11 +2116,11 @@ describe('automatic listener and loader composition', () => {
     })
     const pressured = conversation(4)
     await preStep(ctx, agent(pressured, 'unconfigured-agent-fallback'))
-    expect(pressured.events.some(event => event.type === 'compaction/summary')).toBe(true)
+    expect(pressured.snapshotEvents().some(event => event.type === 'compaction/summary')).toBe(true)
 
     const small = conversation(1)
     await preStep(ctx, agent(small, MODEL))
-    expect(small.events.some(event => event.type === 'compaction/start')).toBe(false)
+    expect(small.snapshotEvents().some(event => event.type === 'compaction/start')).toBe(false)
     expect(compact.calls).toHaveLength(1)
   })
 
@@ -2135,7 +2137,7 @@ describe('automatic listener and loader composition', () => {
       .resolves.toEqual({ kind: 'enter', messages: [] })
 
     expect(compactIfNeeded).not.toHaveBeenCalled()
-    expect(pressured.events.some(event => event.type === 'compaction/start')).toBe(false)
+    expect(pressured.snapshotEvents().some(event => event.type === 'compaction/start')).toBe(false)
   })
 
   it('warns and continues after operational failures, including non-Errors', async () => {
@@ -2151,7 +2153,7 @@ describe('automatic listener and loader composition', () => {
 
     await expect(preStep(ctx, agent(session, MODEL))).resolves.toEqual({ kind: 'enter', messages: [] })
     expect(warnings).toContainEqual(expect.stringContaining('temporary failure'))
-    expect(session.events.some(event => event.type === 'compaction/summary')).toBe(false)
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/summary')).toBe(false)
   })
 
   it('warns once per routed target when proactive pressure has no context metadata', async () => {
@@ -2210,7 +2212,7 @@ describe('automatic listener and loader composition', () => {
 
     expect(decision).toBe(true)
     expect(session.surface.replaceGeneration).toBe(beforeGeneration + 1)
-    expect(session.events.some(event => event.type === 'compaction/summary')).toBe(true)
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/summary')).toBe(true)
     expect(session.surface.nodes).toContain(retainedSeq)
   })
 
@@ -2229,7 +2231,7 @@ describe('automatic listener and loader composition', () => {
 
     expect(await recover(ctx, agent(session, MODEL), overflow())).toBe(true)
     expect(session.surface.replaceGeneration).toBe(1)
-    expect(session.events.some(event => event.type === 'compaction/summary')).toBe(false)
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/summary')).toBe(false)
     expect(compact.calls).toHaveLength(0)
   })
 
@@ -2247,7 +2249,7 @@ describe('automatic listener and loader composition', () => {
     const session = toolConversation()
 
     expect(await recover(ctx, agent(session, MODEL), overflow())).toBe(true)
-    expect(session.events.some(event => event.type === 'compaction/summary')).toBe(true)
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/summary')).toBe(true)
     expect(compact.calls).toHaveLength(1)
     expect(summarizedText(compact.calls[0]!.input)).toContain('tool result middle pruned')
   })
@@ -2270,8 +2272,8 @@ describe('automatic listener and loader composition', () => {
 
     expect(await recover(ctx, agent(session, MODEL), overflow())).toBe(true)
     expect(session.surface.replaceGeneration).toBe(1)
-    expect(session.events.filter(event => event.type === 'tool/result')).toHaveLength(2)
-    expect(session.events.findLast(event => event.type === 'compaction/end')?.data)
+    expect(session.snapshotEvents().filter(event => event.type === 'tool/result')).toHaveLength(2)
+    expect(session.snapshotEvents().findLast(event => event.type === 'compaction/end')?.data)
       .toMatchObject({ error: 'summary unavailable after prune' })
     expect(warnings).toContainEqual(expect.stringContaining('retrying from the replacement surface'))
   })
@@ -2320,12 +2322,12 @@ describe('automatic listener and loader composition', () => {
     const session = conversation(2)
     const fakeResult: CompactionResult = {
       compactionId: CompactionId('fake-compaction'),
-      startSeq: 1,
-      summarySeq: 2,
-      endSeq: 3,
+      startSeq: SessionSeq(1),
+      summarySeq: SessionSeq(2),
+      endSeq: SessionSeq(3),
       summary: [{ type: 'text', text: 'fake' }],
-      shadowedRange: { start: 1, end: 2 },
-      shadowedSeqs: [1, 2],
+      shadowedRange: { start: SessionSeq(1), end: SessionSeq(2) },
+      shadowedSeqs: [SessionSeq(1), SessionSeq(2)],
       shadowedTokenCount: 10,
     }
     vi.spyOn(compact, 'compactIfNeeded').mockResolvedValue(fakeResult)
@@ -2406,7 +2408,7 @@ describe('automatic listener and loader composition', () => {
     })
     expect(await recover(ctx, agent(session, MODEL), overflow('unlisted-model overflow')))
       .toBe(true)
-    const record = session.events
+    const record = session.snapshotEvents()
       .map(event => convergenceRecord(event))
       .findLast(candidate => candidate?.outcome === 'succeeded')
     expect(record).toMatchObject({ state: 'one-shot', willContinueJob: false })
@@ -2422,7 +2424,7 @@ describe('automatic listener and loader composition', () => {
 
     expect(await recover(ctx, agent(session, MODEL), overflow('policy-independent overflow')))
       .toBe(true)
-    const record = session.events
+    const record = session.snapshotEvents()
       .map(event => convergenceRecord(event))
       .findLast(candidate => candidate?.outcome === 'succeeded')
     expect(record).toMatchObject({ state: 'one-shot', willContinueJob: false })
@@ -2492,10 +2494,10 @@ describe('automatic listener and loader composition', () => {
     })
     const session = conversation(4)
     await preStep(ctx, agent(session, MODEL))
-    const summaries = session.events.filter(event => event.type === 'compaction/summary').length
+    const summaries = session.snapshotEvents().filter(event => event.type === 'compaction/summary').length
     expect(summaries).toBe(1)
     expect(await recover(ctx, agent(session, MODEL), overflow())).toBe(false)
-    expect(session.events.filter(event => event.type === 'compaction/summary')).toHaveLength(summaries)
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/summary')).toHaveLength(summaries)
   })
 
   it('auto:false installs neither automatic listener', async () => {
@@ -2507,7 +2509,7 @@ describe('automatic listener and loader composition', () => {
     })
     const session = conversation(4)
     await preStep(ctx, agent(session, MODEL))
-    expect(session.events.some(event => event.type === 'compaction/start')).toBe(false)
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/start')).toBe(false)
     expect(await recover(ctx, agent(session, MODEL), overflow())).toBe(false)
   })
 
@@ -2515,6 +2517,7 @@ describe('automatic listener and loader composition', () => {
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
     const meterFiber = await ctx.plugin(TokenMeter)
     const compactFiber = await ctx.plugin(BasicCompactionEngine, { auto: false })
 
@@ -2528,6 +2531,7 @@ describe('automatic listener and loader composition', () => {
   it('removes its automatic listener with the plugin fiber', async () => {
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(TokenMeter)
     const fiber = await ctx.plugin(TestCompactionEngine, {
       thresholdRatio: 0.5,
@@ -2537,7 +2541,7 @@ describe('automatic listener and loader composition', () => {
 
     const session = conversation(4)
     await preStep(ctx, agent(session, MODEL))
-    expect(session.events.some(event => event.type === 'compaction/start')).toBe(false)
+    expect(session.snapshotEvents().some(event => event.type === 'compaction/start')).toBe(false)
     expect(await recover(ctx, agent(session, MODEL), overflow())).toBe(false)
   })
 })

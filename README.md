@@ -4,6 +4,8 @@ English | [中文](README.zh.md)
 
 The **convergent compaction backend** is a source-compatible replacement for `@deepseek-ai/dsh-compaction-basic`. It keeps the official `BasicCompactionEngine` transaction and service contracts while making one automatic trigger continue in finite, safe chunks until request pressure is below threshold.
 
+The `0.1.2-rc.1-convergent.*` release line requires the DSH `0.1.2-rc.1` package family and Cordis `4.0.2`; do not mix it with DSH `0.1.1-rc.2` packages.
+
 This package is derived from DeepSeek Harness commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e` under the MIT License. See [NOTICE.md](NOTICE.md).
 
 ## Build and release

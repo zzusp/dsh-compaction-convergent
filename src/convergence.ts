@@ -208,7 +208,7 @@ export function restoreConvergence(
   const profiles = new Map<string, SummaryCapacityProfile>()
   const records: CompactionConvergenceRecord[] = []
   let latest: CompactionConvergenceRecord | undefined
-  for (const event of session.events) {
+  for (const event of session.snapshotEvents()) {
     const record = convergenceRecord(event)
     if (record === undefined) continue
     records.push(record)

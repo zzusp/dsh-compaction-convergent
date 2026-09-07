@@ -3,7 +3,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { toolPairingBalancedAfter, toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
 import { createUserMessage, CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, resolveRetryPolicy , createMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, LlmResolvedModelInfo, ResolvedRetryPolicy, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { CallId, LlmAdapter } from '@deepseek-ai/dsh-llm'
+import { ToolCallId as CallId, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
@@ -14,6 +14,7 @@ import * as AgentInvariant from '@deepseek-ai/dsh-agent/invariant'
 import * as AgentLoopInvariant from '@deepseek-ai/dsh-agent-loop/invariant'
 import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import * as LlmRetry from '@deepseek-ai/dsh-llm-retry'
 import { Session, SessionId, type SessionEvent, type SurfaceEvent } from '@deepseek-ai/dsh-session'
 
@@ -167,6 +168,7 @@ async function harness(toolSteps: number): Promise<{ ctx: Context; compact: Repr
   await mountAgentLoopTestDependencies(ctx)
   await mountInvariants(ctx)
   await ctx.plugin(AgentLoop, { agents: [] })
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(TokenMeter)
   ctx.llm.registerAdapter(['mock'], new StepwiseToolAdapter(toolSteps))
   ctx.tools.register(defineContentToolFixture({
@@ -227,7 +229,7 @@ function overflowHistorySeed(): SessionEvent[] {
     session.append('step/end', { turn, step: 1 })
     session.append('turn/end', { turn, reason: { kind: 'completed' } })
   }
-  return [...session.events]
+  return [...session.snapshotEvents()]
 }
 
 describe('CBR-001: a real-loop checkpoint is a valid boundary on both sides', () => {
@@ -245,8 +247,8 @@ describe('CBR-001: a real-loop checkpoint is a valid boundary on both sides', ()
       await waitForIdle(ctx, agent)
 
       expect(agent.session.requestHeader()?.config.model).toBe('mock')
-      expect(agent.session.events.some(event => event.type === 'compaction/summary')).toBe(true)
-      expect(agent.session.events.at(-1)).toMatchObject({
+      expect(agent.session.snapshotEvents().some(event => event.type === 'compaction/summary')).toBe(true)
+      expect(agent.session.snapshotEvents().at(-1)).toMatchObject({
         type: 'turn/end',
         data: { reason: { kind: 'completed' } },
       })
@@ -262,7 +264,7 @@ describe('CBR-001: a real-loop checkpoint is a valid boundary on both sides', ()
       agent.followup(createUserMessage({ content: [{ type: 'text', text: 'do tool work' }], source: { kind: 'user' } }))
       await waitForIdle(ctx, agent)
 
-      const events = [...agent.session.events]
+      const events = [...agent.session.snapshotEvents()]
       const compactStart = events.find(event => event.type === 'compaction/start')
       expect(compactStart).toBeDefined()
       const precedingResult = events.findLast(event =>
@@ -294,7 +296,7 @@ describe('CBR-001: a real-loop checkpoint is a valid boundary on both sides', ()
       agent.followup(createUserMessage({ content: [{ type: 'text', text: 'do a long multi-step task' }], source: { kind: 'user' } }))
       await waitForIdle(ctx, agent)
 
-      const events = [...agent.session.events]
+      const events = [...agent.session.snapshotEvents()]
       // A compaction ran: at least one checkpoint landed on the surface.
       const checkpoints = events.filter(
         (e): e is SurfaceEvent =>
@@ -329,6 +331,7 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
       await mountAgentLoopTestDependencies(ctx)
       await mountInvariants(ctx)
       await ctx.plugin(AgentLoop, { agents: [] })
+      await ctx.plugin(SessionProjectionRegistry)
       await ctx.plugin(TokenMeter)
       ctx.llm.registerAdapter(['mock'], adapter)
       ctx.on('agent/request', async (_payload, next) => ({
@@ -367,7 +370,7 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
         expect(retry).toContain('RECOVERY CHECKPOINT')
         expect(retry).not.toContain('OLD HISTORY SENTINEL')
 
-        const events = [...agent.session.events]
+        const events = [...agent.session.snapshotEvents()]
         const stepStart = events.find(event =>
           event.type === 'step/start' && event.data.turn === 3 && event.data.step === 1,
         )!
@@ -407,6 +410,7 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
     await mountAgentLoopTestDependencies(ctx)
     await mountInvariants(ctx)
     await ctx.plugin(AgentLoop, { agents: [] })
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(TokenMeter)
     ctx.llm.registerAdapter(['mock'], adapter)
     await ctx.plugin(BasicCompactionEngine, {
@@ -437,7 +441,7 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
       const retry = JSON.stringify(adapter.conversationRequests[1]!.messages)
       expect(retry).toContain('RECOVERY CHECKPOINT')
       expect(retry).not.toContain('OLD HISTORY SENTINEL')
-      expect(agent.session.events.at(-1)).toMatchObject({
+      expect(agent.session.snapshotEvents().at(-1)).toMatchObject({
         type: 'turn/end',
         data: { reason: { kind: 'completed' } },
       })
@@ -453,6 +457,7 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
     await mountInvariants(ctx)
     await ctx.plugin(LlmRetry)
     await ctx.plugin(AgentLoop, { agents: [] })
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(TokenMeter)
     ctx.llm.registerAdapter(['mock'], adapter)
     await ctx.plugin(BasicCompactionEngine, {
@@ -474,11 +479,11 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
 
       expect(adapter.conversationRequests).toHaveLength(3)
       expect(adapter.summaryRequests).toHaveLength(1)
-      expect(agent.session.events.filter(event => event.type === 'llm/retry').map(event => event.data))
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'llm/retry').map(event => event.data))
         .toEqual([expect.objectContaining({ turn: 3, step: 1, retry: 1, failure: { message: 'temporary provider outage', code: 'SERVER' } })])
-      expect(agent.session.events.filter(event => event.type === 'turn/start').slice(-1).map(event => event.data.turn))
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'turn/start').slice(-1).map(event => event.data.turn))
         .toEqual([3])
-      expect(agent.session.events.at(-1)).toMatchObject({
+      expect(agent.session.snapshotEvents().at(-1)).toMatchObject({
         type: 'turn/end',
         data: { reason: { kind: 'completed' } },
       })

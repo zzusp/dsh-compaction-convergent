@@ -4,7 +4,7 @@
 
 ## 1. 下载 Release 产物
 
-要求 Node.js 24，并将 `<version>` 替换为目标 Release（例如 `v0.1.1-rc.2-convergent.1`）：
+要求 Node.js 24、DSH `0.1.2-rc.1` 和 Cordis `4.0.2`，并将 `<version>` 替换为目标 Release（例如 `v0.1.2-rc.1-convergent.1`）：
 
 ```powershell
 $releaseDir = Join-Path $PWD 'dsh-compaction-release'
