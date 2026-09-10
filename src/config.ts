@@ -21,6 +21,7 @@ const DEFAULT_THRESHOLD_RATIO = 0.8
 
 /** Default verbatim-tail fraction for every routed model. */
 const DEFAULT_RETAIN_RATIO = 0.16
+const DEFAULT_RETAIN_TOKEN_CAP = 12_000
 
 /** Fields shared by top-level defaults and exact-target overrides. */
 const POLICY_CONFIG_KEYS = [
@@ -72,7 +73,7 @@ export function resolveConfig(config: BasicCompactionConfig = {}): ResolvedConfi
   }
 
   const thresholdRatio = config.thresholdRatio ?? DEFAULT_THRESHOLD_RATIO
-  const retention = resolveRetention(config, { retainRatio: DEFAULT_RETAIN_RATIO })
+  const retention = resolveRetention(config, {})
   validateRatioRetention(thresholdRatio, retention, 'BasicCompactionConfig')
   const modelPolicies = resolveModelPolicies(config.modelPolicies)
   for (const [index, policy] of modelPolicies.entries()) {
@@ -109,9 +110,7 @@ export function resolveTargetPolicy(
   const override = config.modelPolicies.find(policy => (
     policy.provider === target.provider && policy.model === target.model
   ))
-  const inheritedRetention: ResolvedRetention = config.retainTokens === undefined
-    ? { retainRatio: config.retainRatio }
-    : { retainTokens: config.retainTokens }
+  const inheritedRetention = resolveRetention(config, {})
   return deepFreeze({
     target: { provider: target.provider, model: target.model },
     thresholdRatio: override?.thresholdRatio ?? config.thresholdRatio,
@@ -142,9 +141,9 @@ export function resolveCompactSpec(
     )
   }
   const thresholdTokens = Math.floor(contextWindow * policy.thresholdRatio)
-  const retainTokens = policy.retainTokens === undefined
-    ? Math.floor(contextWindow * policy.retainRatio)
-    : policy.retainTokens
+  const retainTokens = policy.retainTokens ?? (policy.retainRatio === undefined
+    ? Math.min(DEFAULT_RETAIN_TOKEN_CAP, Math.floor(contextWindow * DEFAULT_RETAIN_RATIO))
+    : Math.floor(contextWindow * policy.retainRatio))
   if (retainTokens >= thresholdTokens) {
     throw new TargetPressureConfigError(
       targetKey,
@@ -182,9 +181,11 @@ function validateRatioRetention(
   retention: ResolvedRetention,
   name: string,
 ): void {
-  if (retention.retainRatio !== undefined && retention.retainRatio >= thresholdRatio) {
+  const ratio = retention.retainRatio
+    ?? (retention.retainTokens === undefined ? DEFAULT_RETAIN_RATIO : undefined)
+  if (ratio !== undefined && ratio >= thresholdRatio) {
     throw new Error(
-      `${name}: retainRatio (${retention.retainRatio}) must be less than `
+      `${name}: retainRatio (${ratio}) must be less than `
       + `the resolved thresholdRatio (${thresholdRatio})`,
     )
   }

@@ -43,7 +43,7 @@
 | Key | 必填 | 含义 |
 |---|---|---|
 | `thresholdRatio` | 否（默认 `0.8`） | 在 `floor(routedContextWindow × ratio)` 处压缩。 |
-| `retainRatio` | 否（默认 `0.16`） | 以已路由上下文窗口的一部分表示逐字保留的近期表层预算；与 `retainTokens` 互斥。 |
+| `retainRatio` | 否 | 显式指定近期原文占窗口的比例，与 `retainTokens` 互斥。两者均未配置时，预算为 `min(12000, floor(contextWindow × 0.16))`。 |
 | `retainTokens` | 否 | 逐字保留的近期表层绝对预算；与 `retainRatio` 互斥，并且必须低于已解析阈值。 |
 | `summarizationProvider` | 否（默认 `''`） | 与 `summarizationModel` 一起设置；空对会解析为最新已记录请求目标，再回退到 `AgentOptions` 对。 |
 | `summarizationModel` | 否（默认 `''`） | 与 `summarizationProvider` 一起设置；空对会解析为最新已记录请求目标，再回退到 `AgentOptions` 对。 |
@@ -56,6 +56,10 @@
 每个 `modelPolicies` 配置项都接受上述策略字段，但不接受 `auto` 和 `modelPolicies` 自身。如果配置项提供任意一个保留字段，就替换默认策略的保留选择；否则继承保留设置。摘要提供方／模型在每个配置项内仍然成对。
 
 适配器可能无法为有效动态路由返回容量，已解析容量也可能暴露无效的绝对保留预算。此时手动压力检查会抛出目标特定配置错误；自动 listener 会对该精确目标警告一次，并携带完整历史继续。不相关的操作性失败仍会独立可见。规范提供方溢出仍会尝试恢复，因为提供方已确立压缩的必要性。
+
+默认近期原文预算最多 12,000 token（272k 窗口下从 43,520 降至 12,000），小窗口仍保留 16% 预算。显式配置的比例或绝对预算不受此上限影响。工具调用配对边界可能使实际保留量略超预算；系统提示和工具定义不参与摘要，所以此预算不是总上下文占用目标。
+
+默认摘要器仅在摘要模型公开支持 `low` 时显式选择该推理强度，否则保留提供方默认行为。摘要提示词以约 1,500 token 为软目标，允许为保留关键续接信息超出目标；仍保留 8,192 生成上限和截断拒绝检查。所选推理强度变化会使旧容量学习失效。速度收益须通过真实模型的输入量、缓存命中和输出耗时验证，不能由单测推出。
 
 ## 用法
 
@@ -85,7 +89,7 @@ export function apply(ctx: Context): void {
 - name: '@zzusp/dsh-compaction-convergent'
   config:
     thresholdRatio: 0.8
-    retainRatio: 0.16
+    # 不设置两种保留字段，使用有上限的默认预算。
     modelPolicies:
       - provider: local
         model: small-context

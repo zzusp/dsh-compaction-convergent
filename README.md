@@ -43,7 +43,7 @@ Every setting is optional. Top-level policy fields are defaults for every routed
 | Key | Required | Meaning |
 |---|---|---|
 | `thresholdRatio` | no (default `0.8`) | Compact at `floor(routedContextWindow × ratio)`. |
-| `retainRatio` | no (default `0.16`) | Recent surface budget kept verbatim as a fraction of the routed context window; mutually exclusive with `retainTokens`. |
+| `retainRatio` | no | Explicit recent surface fraction; mutually exclusive with `retainTokens`. If both are omitted, retention is `min(12000, floor(contextWindow × 0.16))`. |
 | `retainTokens` | no | Absolute recent surface budget kept verbatim; mutually exclusive with `retainRatio` and must be below the resolved threshold. |
 | `summarizationProvider` | no (default `''`) | Set together with `summarizationModel`; an empty pair resolves the latest logged request target, then the `AgentOptions` pair. |
 | `summarizationModel` | no (default `''`) | Set together with `summarizationProvider`; an empty pair resolves the latest logged request target, then the `AgentOptions` pair. |
@@ -56,6 +56,10 @@ Every setting is optional. Top-level policy fields are defaults for every routed
 Every `modelPolicies` entry accepts the policy fields above except `auto` and `modelPolicies` itself. If an entry supplies either retention field, it replaces the default policy's retention choice; otherwise retention is inherited. Summarization provider/model remain a pair inside each entry.
 
 An adapter may return no capacity for a valid dynamic route, and resolved capacity may expose an invalid absolute retention budget. Manual pressure checks then throw a target-specific configuration error; the automatic listener warns once for that exact target and continues with full history. Unrelated operational failures remain independently visible. Canonical provider overflow still attempts recovery because the provider has already established that compaction is necessary.
+
+The implicit retention budget is capped at 12,000 tokens (43,520 → 12,000 for a 272k window), while small windows retain their 16% budget. Explicit retention values are never capped. Tool-pair boundaries can retain more than the budget. System prompts and tool schemas are not summarized, so the budget is not a target for total context occupancy.
+
+The default summarizer explicitly requests `low` only when the summary model advertises that effort; otherwise it preserves the provider default. Its checkpoint instruction targets about 1,500 tokens, allowing essential continuation facts to exceed that soft budget. The 8,192-token generation cap and rejection of truncated summaries remain in place. Learned capacity is invalidated when the selected effort changes. This does not guarantee a latency reduction: provider input, cache hits, and output generation still require real-model measurement.
 
 ## Usage
 
@@ -85,7 +89,7 @@ For example, the same compact plugin can safely serve models with different capa
 - name: '@zzusp/dsh-compaction-convergent'
   config:
     thresholdRatio: 0.8
-    retainRatio: 0.16
+    # Omit both retention fields to use the capped default.
     modelPolicies:
       - provider: local
         model: small-context

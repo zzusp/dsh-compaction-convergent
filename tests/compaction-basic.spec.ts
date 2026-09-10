@@ -12,6 +12,8 @@ import {
   SummaryNotSmallerError,
 } from '@deepseek-ai/dsh-compaction-basic/src/region.ts'
 import type { SummarizationInput, SummaryResult } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts'
+import { estimateDefaultSummaryEnvelope } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { convergenceRecord } from '@deepseek-ai/dsh-compaction-basic/src/convergence.ts'
 import { CompactionId, toolPairingBalancedAfter, toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
 import {
@@ -300,7 +302,6 @@ describe('compact configuration and defaults', () => {
 
     expect(resolved).toEqual({
       thresholdRatio: 0.8,
-      retainRatio: 0.16,
       summarizationProvider: '',
       summarizationModel: '',
       maxTokens: 8192,
@@ -318,8 +319,10 @@ describe('compact configuration and defaults', () => {
     })
     expect(thresholdOnly).toMatchObject({
       thresholdRatio: 0.5,
-      retainRatio: 0.16,
     })
+    expect(resolveCompactSpec(resolveTargetPolicy(thresholdOnly, {
+      provider: MODEL, model: MODEL,
+    }), 272_000).retainTokens).toBe(12_000)
 
     const retentionOnly = resolveConfig({
       retainTokens: 70,
@@ -329,6 +332,29 @@ describe('compact configuration and defaults', () => {
       retainTokens: 70,
     })
     expect(retentionOnly).not.toHaveProperty('retainRatio')
+  })
+
+  it.each([1_000, 32_000, 272_000, 872_000])('caps only implicit retention for a %i-token model', (window) => {
+    const target = { provider: MODEL, model: MODEL }
+    const defaultPolicy = resolveTargetPolicy(resolveConfig({}), target)
+    expect(resolveCompactSpec(defaultPolicy, window).retainTokens)
+      .toBe(Math.min(12_000, Math.floor(window * 0.16)))
+    const explicitRatio = resolveTargetPolicy(resolveConfig({ retainRatio: 0.16 }), target)
+    expect(resolveCompactSpec(explicitRatio, window).retainTokens).toBe(Math.floor(window * 0.16))
+    const explicitTokens = resolveTargetPolicy(resolveConfig({ retainTokens: 50 }), target)
+    expect(resolveCompactSpec(explicitTokens, window).retainTokens).toBe(50)
+  })
+
+  it('inherits the capped default unless an exact model policy supplies retention', () => {
+    const config = resolveConfig({ modelPolicies: [
+      { provider: MODEL, model: 'implicit', maxTokens: 512 },
+      { provider: MODEL, model: 'ratio', retainRatio: 0.16 },
+      { provider: MODEL, model: 'tokens', retainTokens: 20_000 },
+    ] })
+    for (const [model, expected] of [['implicit', 12_000], ['ratio', 43_520], ['tokens', 20_000]] as const) {
+      expect(resolveCompactSpec(resolveTargetPolicy(config, { provider: MODEL, model }), 272_000).retainTokens)
+        .toBe(expected)
+    }
   })
 
   it('merges exact provider/model policy overrides and scales ratios per model', () => {
@@ -487,6 +513,34 @@ describe('compact configuration and defaults', () => {
 })
 
 describe('pressure measurement and retention', () => {
+  it('reduces the large-window tail and preserves reload and continuation', async () => {
+    const run = async (config: BasicCompactionConfig) => {
+      const ctx = createContext(272_000)
+      const compact = service(config, ctx)
+      const session = conversation(40, 'x'.repeat(12_000))
+      const before = ctx.tokenMeter.measure(session)
+      expect(before.totalTokens).toBeGreaterThan(217_600)
+      const result = await compactIfNeeded(compact, session)
+      expect(result).not.toBeNull()
+      expect(compact.calls).toHaveLength(1)
+      const after = ctx.tokenMeter.measure(session)
+      const retained = before.surfaceTokens - result!.shadowedTokenCount
+      const reloaded = Session.create(session.id, session.snapshotEvents(), session.header)
+      expect(ctx.tokenMeter.measure(reloaded).totalTokens).toBe(after.totalTokens)
+      reloaded.append('user/message', createUserMessage({
+        content: [{ type: 'text', text: 'continue from the checkpoint' }], source: { kind: 'user' },
+      }), { surfaceOp: 'append' })
+      expect(ctx.tokenMeter.measure(reloaded).totalTokens).toBeGreaterThan(after.totalTokens)
+      return { retained, after: after.totalTokens }
+    }
+    const current = await run({ auto: false })
+    const previous = await run({ auto: false, retainRatio: 0.16 })
+    expect(current.retained).toBeGreaterThanOrEqual(12_000)
+    expect(current.retained).toBeLessThan(16_000)
+    expect(previous.retained).toBeGreaterThanOrEqual(43_520)
+    expect(current.after).toBeLessThan(previous.after - 28_000)
+  })
+
   const compactConfig: BasicCompactionConfig = {
     auto: false,
     thresholdRatio: 0.5,
@@ -1405,6 +1459,42 @@ async function summarizerHarness(
 }
 
 describe('default one-shot summarizer', () => {
+  it.each([{ efforts: undefined }, { efforts: ['medium'] }, { efforts: ['high', 'low'] }])('uses low only when advertised by the summary route: $efforts', async ({ efforts }) => {
+    const { adapter, compact } = await summarizerHarness(
+      [{ type: 'text', text: 'checkpoint' }], undefined, 'summary-route', {
+        auto: false, summarizationProvider: 'summary-route', summarizationModel: 'summary-route',
+      },
+    )
+    const resolve = vi.spyOn(adapter, 'resolveModel').mockResolvedValue({
+      provider: 'summary-route', id: 'summary-route', name: 'Summary',
+      ...(efforts === undefined ? {} : { reasoning: {
+        efforts: efforts.map(id => ({ id: ReasoningEffortId(id), name: id })),
+      } }),
+    })
+    await compact.runSummarize(promptInput('history'), agent(conversation(1), MODEL))
+    expect(resolve).toHaveBeenCalledWith('summary-route', 'summary-route', undefined)
+    if (efforts?.includes('low')) expect(adapter.lastOptions?.reasoningEffort).toBe('low')
+    else expect(adapter.lastOptions).not.toHaveProperty('reasoningEffort')
+    const instruction = adapter.lastOptions!.messages.at(-1)!.content[0]!
+    expect(instruction.type === 'text' && instruction.text).toContain('soft budget')
+  })
+
+  it('invalidates learned capacity when low support changes and aligns preflight with dispatch', async () => {
+    const { ctx, adapter, compact } = await summarizerHarness([{ type: 'text', text: 'checkpoint' }])
+    const modelInfo = { provider: MODEL, id: MODEL, name: MODEL }
+    const resolve = vi.spyOn(adapter, 'resolveModel').mockResolvedValue(modelInfo)
+    const owner = agent(conversation(1), MODEL)
+    const input = promptInput('history')
+    const previous = await compact.runSummarize(input, owner)
+    resolve.mockResolvedValue({ ...modelInfo, reasoning: {
+      efforts: [{ id: ReasoningEffortId('low'), name: 'Low' }],
+    } })
+    const estimate = await estimateDefaultSummaryEnvelope(ctx, ctx.tokenMeter, compact.config, input, owner)
+    const current = await compact.runSummarize(input, owner)
+    expect(current.summaryEnvelope?.capacityKey).not.toBe(previous.summaryEnvelope?.capacityKey)
+    expect(current.summaryEnvelope).toEqual(estimate)
+  })
+
   it('requires complete raw output when a subclass marks one local LLM stream call', () => {
     expectTypeOf<{
       summary: ContentBlock[]
@@ -1695,8 +1785,10 @@ describe('summary input capacity convergence', () => {
   }
 
   it('budgets system, tools, instruction, and output before dispatching the largest balanced prefix', async () => {
+    // 包含新的摘要软预算指令，同时仍让带请求头的输入超过单次容量。
+    const contextWindow = 2_000
     const run = async (withEnvelope: boolean) => {
-      const { ctx, adapter, compact } = capacityService(1_800)
+      const { ctx, adapter, compact } = capacityService(contextWindow)
       const session = conversation(5, 'x'.repeat(400))
       if (withEnvelope) {
         session.append('request/header', {
@@ -1743,9 +1835,9 @@ describe('summary input capacity convergence', () => {
       (total, message) => total + enveloped.ctx.tokenMeter.estimateMessage(message),
       0,
     )
-    expect(dispatchedInputTokens + 64).toBeLessThanOrEqual(1_800)
+    expect(dispatchedInputTokens + 64).toBeLessThanOrEqual(contextWindow)
     const nextNode = enveloped.measurement.nodes[enveloped.result!.shadowedSeqs.length]!
-    expect(dispatchedInputTokens + nextNode.tokens + 64).toBeGreaterThan(1_800)
+    expect(dispatchedInputTokens + nextNode.tokens + 64).toBeGreaterThan(contextWindow)
     expect(enveloped.session.snapshotEvents().filter(event => event.type === 'compaction/start').length)
       .toBeGreaterThan(enveloped.adapter.requests.length)
   })

@@ -10,9 +10,9 @@ import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
 export interface CompactionPolicyConfig {
   /** Compact at this fraction of the model's context window. Defaults to `0.8`. */
   thresholdRatio?: number
-  /** Recent context retained as a fraction of the model's window. Defaults to `0.16`. */
+  /** Explicit recent-context fraction; mutually exclusive with `retainTokens`. */
   retainRatio?: number
-  /** Absolute recent-context budget; mutually exclusive with `retainRatio`. */
+  /** Absolute recent-context budget; when both forms are omitted, use min(12000, window * 0.16). */
   retainTokens?: number
   /** Summary provider; set together with `summarizationModel`, or inherit the conversation target. */
   summarizationProvider?: string
@@ -42,10 +42,11 @@ export interface BasicCompactionConfig extends CompactionPolicyConfig {
   auto?: boolean
 }
 
-/** Exactly one validated retention form. */
+/** One explicit retention form, or neither for the capacity-capped default. */
 export type ResolvedRetention =
   | { readonly retainRatio: number; readonly retainTokens?: never }
   | { readonly retainRatio?: never; readonly retainTokens: number }
+  | { readonly retainRatio?: never; readonly retainTokens?: never }
 
 /** Validated policy fields shared before and after exact-target matching. */
 interface ResolvedPolicyFields {

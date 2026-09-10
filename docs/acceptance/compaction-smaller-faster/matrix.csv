@@ -1,0 +1,10 @@
+case,round-1
+implicit-retention-large-and-small-models,PASS
+explicit-retention-and-model-overrides,PASS
+automatic-tail-reduction-reload-append,PASS
+supported-low-and-unsupported-effort,PASS
+reasoning-capacity-key-preflight-parity,PASS
+typecheck-and-153-tests,PASS
+coverage-build-package,PASS
+real-event-range-comparison,PASS
+real-provider-latency-and-semantic-continuation,NOT_RUN

@@ -44,11 +44,15 @@ dsh plugin --profile resident add $package.FullName
       name: '@zzusp/dsh-compaction-convergent'
       config:
         thresholdRatio: 0.8
-        retainRatio: 0.16
+        # 省略 retainRatio / retainTokens，使用 min(12000, window × 0.16)。
         maxTokens: 8192
         compactionRetries: 1
         maxOverflowRetries: 1
 ```
+
+若旧 profile 显式设置了 `retainRatio: 0.16`，升级包后仍会保留该设置；要采用新的默认预算，删除该保留配置。也可显式设置 `retainTokens: 12000`，但此绝对值必须低于目标模型的压缩阈值，小窗口应省略保留配置。需要恢复旧保留策略时重新设置 `retainRatio: 0.16`；完整回滚则安装升级前的 Release。
+
+摘要模型支持 `low` 时插件会显式选择它，否则保留提供方默认。验收时记录 `compaction/start` 至 `compaction/summary` 的耗时、下一次主请求的 provider 实际输入 token，以及检查点是否保留待办和约束；界面估算占用不能替代实际用量。人工缩短 `maxTokens` 可能使检查点截断失败，不应将其作为摘要长度目标。
 
 不要写成下面这样：
 

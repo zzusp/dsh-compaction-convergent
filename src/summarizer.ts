@@ -14,7 +14,7 @@ import {
   LlmError,
 } from '@deepseek-ai/dsh-llm'
 import type {
-  ContentBlock, FinishReason, GenerateOptions, Message, TokenUsage, ToolSchema,
+  ContentBlock, FinishReason, GenerateOptions, LlmResolvedModelInfo, Message, TokenUsage, ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
@@ -66,6 +66,9 @@ const COMPACTION_INSTRUCTION = [
   '- [decisions and their rationale, constraints, user preferences, open questions, data needed to continue]',
   '',
   'Rules:',
+  '- Aim for about 1,500 tokens total. This is a soft budget: exceed it when needed to preserve essential continuation facts, never cut off a section or sentence.',
+  '- Prioritize pending user requests, constraints, current state, unresolved failures, and the next action. Deduplicate facts across sections; reduce completed work to its outcome and evidence reference.',
+  '- Refer to paths and symbols instead of copying code or long logs. Preserve an exact snippet only when the next action requires it and it cannot be recovered from a referenced artifact.',
   '- Write concise English engineering prose. Preserve exact file paths, commands, error strings, identifiers, numeric values, function signatures, and syntax fragments.',
   '- Capture user feedback and explicit instructions faithfully, especially corrections.',
   '- Do NOT mention this summarization request or that the context was compacted.',
@@ -210,8 +213,9 @@ function estimateSummaryEnvelope(
   model: string,
   maxTokens: number,
   instruction: Message,
-  contextWindow: number | undefined,
+  modelInfo: LlmResolvedModelInfo,
 ): SummaryEnvelopeEstimate {
+  const contextWindow = modelInfo.context?.contextWindow
   const envelope = meter.measure(agent.session, {
     config: { provider, model, maxTokens },
     ...input.system === undefined ? {} : { system: input.system },
@@ -229,6 +233,7 @@ function estimateSummaryEnvelope(
     model,
     contextWindow: contextWindow ?? null,
     maxTokens,
+    reasoningEffort: summaryReasoningEffort(modelInfo) ?? null,
     fixedEnvelopeTokens,
     instruction: COMPACTION_INSTRUCTION,
     system: input.system ?? null,
@@ -275,7 +280,7 @@ export async function estimateDefaultSummaryEnvelope(
     target.model,
     config.maxTokens,
     instruction,
-    modelInfo.context?.contextWindow,
+    modelInfo,
   )
 }
 
@@ -301,6 +306,8 @@ export async function summarizeWithLlm(
 ): Promise<SummaryResult> {
   const target = summaryTarget(config, agent)
 
+  const modelInfo = await ctx.llm.resolveModelInfo(target.provider, target.model, signal)
+  const reasoningEffort = summaryReasoningEffort(modelInfo)
   const instruction = compactionInstructionMessage()
   const messages: Message[] = [
     ...input.messages,
@@ -315,9 +322,9 @@ export async function summarizeWithLlm(
     maxTokens: config.maxTokens,
     sessionId: agent.session.id,
     purpose: 'compaction',
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     ...signal === undefined ? {} : { signal },
   }
-  const modelInfo = await ctx.llm.resolveModelInfo(target.provider, target.model, signal)
   const estimate = estimateSummaryEnvelope(
     meter,
     input,
@@ -326,7 +333,7 @@ export async function summarizeWithLlm(
     target.model,
     config.maxTokens,
     instruction,
-    modelInfo.context?.contextWindow,
+    modelInfo,
   )
   if (estimate.contextWindow !== undefined
     && estimate.estimatedInputTokens + estimate.reservedOutputTokens > estimate.contextWindow) {
@@ -358,6 +365,11 @@ export async function summarizeWithLlm(
     summaryEnvelope: estimate,
     ...(assembler.usage === undefined ? {} : { usage: assembler.usage }),
   }
+}
+
+/** Only request a low effort explicitly advertised by the summary route's adapter. */
+function summaryReasoningEffort(modelInfo: LlmResolvedModelInfo) {
+  return modelInfo.reasoning?.efforts.find(effort => effort.id === 'low')?.id
 }
 
 /** Resolve the same summary route for estimation and dispatch. */
