@@ -4,13 +4,21 @@ English | [中文](README.zh.md)
 
 The **convergent compaction backend** is a source-compatible replacement for `@deepseek-ai/dsh-compaction-basic`. It keeps the official `BasicCompactionEngine` transaction and service contracts while making one automatic trigger continue in finite, safe chunks until request pressure is below threshold.
 
-The `0.1.2-rc.1-convergent.*` release line requires the DSH `0.1.2-rc.1` package family and Cordis `4.0.2`; do not mix it with DSH `0.1.1-rc.2` packages.
+The `0.2.1-alpha.2-convergent.*` release line requires the DSH `0.2.1-alpha.2` package family and Cordis `4.0.5-alpha.1`; do not mix it with older DSH packages.
 
 This package is derived from DeepSeek Harness commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e` under the MIT License. See [NOTICE.md](NOTICE.md).
 
+## DSH 0.2.1-alpha.2 compatibility
+
+This release targets exactly the DSH `0.2.1-alpha.2` package family. It preserves the convergent defaults (8,192 summary output tokens and a 12,000-token cap on implicit retention). Routed output reservations now reduce available message capacity. Optional `headroomTokens` is accepted at the top level and per-model, defaults to `0`, and lowers the trigger budget; unlike official basic, it does not implicitly change `maxTokens`. Set it explicitly when migrating a profile that relies on official headroom.
+
+The new `system/message` surface head is preserved by every range selector and replayed as fixed summary overhead. Tool results are first-class tool-role messages, summary calls include tool history, and `compaction/summary-error` recovery is retained. The removed DSH runtime-invariants package and this package's obsolete `./invariant` companion are no longer loaded; remove old companion entries from profiles. Historical repair accepts current-format Sessions only: migrate older files with the matching official DSH migration first, retaining the original backup.
+
+[Alpha.2 validation and upstream comparison](docs/acceptance/dsh-alpha2/report.md) records deterministic tests and their real-provider limits.
+
 ## Build and release
 
-Only pushing a `v<version>` tag that exactly matches `package.json` triggers GitHub Actions. The workflow runs locked installation, typechecking, 100% coverage tests, build, and `npm pack` on Windows with Node 24, then publishes the package named with the complete source SHA to a GitHub Release together with its SHA-256 file and `provenance.json`. Pull requests and pushes to `main` do not trigger this workflow.
+Only pushing a `v<version>` tag that exactly matches `package.json` triggers GitHub Actions. The workflow runs locked installation, typechecking, coverage tests, build, and `npm pack` on Windows with Node 24, then publishes the package named with the complete source SHA to a GitHub Release together with its SHA-256 file and `provenance.json`. Pull requests and pushes to `main` do not trigger this workflow.
 
 See [Replacing the official compaction plugin](docs/manual/replace-official-plugin.md) for the exact profile patch, verification, and rollback procedure (Chinese).
 
@@ -42,7 +50,8 @@ Every setting is optional. Top-level policy fields are defaults for every routed
 
 | Key | Required | Meaning |
 |---|---|---|
-| `thresholdRatio` | no (default `0.8`) | Compact at `floor(routedContextWindow × ratio)`. |
+| `thresholdRatio` | no (default `0.8`) | Compact at `min(floor(routedContextWindow × ratio), window − routed output reserve − headroom)`. |
+| `headroomTokens` | no (default `0`) | Extra input headroom after the routed request output reservation; does not change the summary cap. |
 | `retainRatio` | no | Explicit recent surface fraction; mutually exclusive with `retainTokens`. If both are omitted, retention is `min(12000, floor(contextWindow × 0.16))`. |
 | `retainTokens` | no | Absolute recent surface budget kept verbatim; mutually exclusive with `retainRatio` and must be below the resolved threshold. |
 | `summarizationProvider` | no (default `''`) | Set together with `summarizationModel`; an empty pair resolves the latest logged request target, then the `AgentOptions` pair. |

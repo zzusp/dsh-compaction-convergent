@@ -35,6 +35,7 @@ import type { CompactionConvergenceRecord, CompactionJobAttempt } from './conver
 interface RegionDependencies {
   readonly meter: TokenMeter
   summarize(input: SummarizationInput, agent: Agent, signal?: AbortSignal): Promise<SummaryResult>
+  recover(error: unknown, agent: Agent, sourceEventSeqs: readonly SessionSeq[], signal?: AbortSignal): boolean
 }
 
 /** One validated inclusive span of current surface positions. */
@@ -58,6 +59,7 @@ interface PreparedCompaction extends SurfaceSelection {
   readonly measurement: TokenMeasurement
   readonly selectedNodes: TokenMeasurement['nodes']
   readonly shadowedTokenCount: number
+  readonly shadowedRouteTokenCount: number
   readonly input: SummarizationInput
 }
 
@@ -141,6 +143,8 @@ export function selectCompactableRange(
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
   const surfaceNodes = matchingSurfaceNodes(session, measurement)
+  const firstIdx = systemHead(session) === undefined ? 0 : 1
+  if (firstIdx === surfaceNodes.length) return null
 
   let accumulated = 0
   let keepFromIdx = pricedNodes.length
@@ -150,17 +154,17 @@ export function selectCompactableRange(
     keepFromIdx = index
     if (accumulated >= retainTokens) break
   }
-  if (keepFromIdx === 0) return null
+  if (keepFromIdx <= firstIdx) return null
 
-  while (keepFromIdx > 0) {
+  while (keepFromIdx > firstIdx) {
     // oxlint-disable-next-line typescript/no-non-null-assertion
     if (toolPairingBalancedBefore(session, surfaceNodes[keepFromIdx]!)) break
     keepFromIdx -= 1
   }
-  if (keepFromIdx === 0) return null
+  if (keepFromIdx <= firstIdx) return null
 
   // oxlint-disable-next-line typescript/no-non-null-assertion
-  const first = surfaceNodes[0]!
+  const first = surfaceNodes[firstIdx]!
   // oxlint-disable-next-line typescript/no-non-null-assertion
   const cutoff = surfaceNodes[keepFromIdx - 1]!
   return { start: first, end: cutoff }
@@ -181,16 +185,18 @@ export function selectLargestCompactablePrefix(
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
   const surfaceNodes = matchingSurfaceNodes(session, measurement)
+  const firstIdx = systemHead(session) === undefined ? 0 : 1
+  if (firstIdx === surfaceNodes.length) return null
   const latestEndIdx = surfaceNodes.indexOf(latestEnd)
   if (latestEndIdx === -1) {
     throw new Error(`compaction: capacity end seq ${latestEnd} not found in surface`)
   }
 
-  const first = surfaceNodes[0]!
+  const first = surfaceNodes[firstIdx]!
   if (!toolPairingBalancedBefore(session, first)) return null
   let tokens = 0
   let selectedEnd: SessionSeq | undefined
-  for (let index = 0; index <= latestEndIdx; index += 1) {
+  for (let index = firstIdx; index <= latestEndIdx; index += 1) {
     tokens += pricedNodes[index]!.tokens
     if (tokens > maxTokens) break
     const end = surfaceNodes[index]!
@@ -208,11 +214,13 @@ export function oldestCompactableSurfaceUnit(
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
   const surfaceNodes = matchingSurfaceNodes(session, measurement)
-  const first = surfaceNodes[0]!
+  const firstIdx = systemHead(session) === undefined ? 0 : 1
+  if (firstIdx === surfaceNodes.length) return null
+  const first = surfaceNodes[firstIdx]!
   if (!toolPairingBalancedBefore(session, first)) return null
 
   let tokens = 0
-  for (let index = 0; index < surfaceNodes.length; index += 1) {
+  for (let index = firstIdx; index < surfaceNodes.length; index += 1) {
     tokens += pricedNodes[index]!.tokens
     const end = surfaceNodes[index]!
     if (toolPairingBalancedAfter(session, end)) return { start: first, end, tokens }
@@ -231,15 +239,25 @@ export function selectMaximalCompactableRange(
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
   const surfaceNodes = matchingSurfaceNodes(session, measurement)
+  const firstIdx = systemHead(session) === undefined ? 0 : 1
+  if (firstIdx === surfaceNodes.length) return null
 
-  const first = surfaceNodes[0]!
+  const first = surfaceNodes[firstIdx]!
   if (!toolPairingBalancedBefore(session, first)) return null
   if (hasOnlyClosedStepOrphans(session)) return { start: first, end: surfaceNodes.at(-1)! }
-  for (let endIdx = surfaceNodes.length - 1; endIdx >= 0; endIdx -= 1) {
+  for (let endIdx = surfaceNodes.length - 1; endIdx >= firstIdx; endIdx -= 1) {
     const end = surfaceNodes[endIdx]!
     if (toolPairingBalancedAfter(session, end)) return { start: first, end }
   }
   return null
+}
+
+/** The system surface head is retained verbatim by every compaction path. */
+function systemHead(session: Session): SessionEvent<'system/message'> | undefined {
+  const seq = session.surface.nodes[0]
+  if (seq === undefined) return undefined
+  const event = session.eventAt(seq)
+  return event?.type === 'system/message' ? event : undefined
 }
 
 /** Validate that positional token pricing belongs to the current surface. */
@@ -270,8 +288,7 @@ function closedStepOrphanIds(session: Session): Set<string> | null {
         if (block.type === 'tool-call') pending.set(block.id, event)
       }
     } else if (event.type === 'tool/result') {
-      const result = event.data.message.content.find(block => block.type === 'tool-result')
-      if (result !== undefined) pending.delete(result.toolCallId)
+      pending.delete(event.data.message.toolCallId)
     }
   }
   for (const event of pending.values()) {
@@ -366,6 +383,8 @@ export async function compactSurfaceRegion(
       agent,
       compactionId,
       options.sourceCommandId,
+      assertStable,
+      options.allowClosedStepOrphans === true,
       signal,
     )
     if (options.owner === null) signal?.throwIfAborted()
@@ -502,6 +521,9 @@ function validateSurfaceRegion(
       `compactRegion: start seq ${start} (position ${startIdx}) is after end seq ${end} (position ${endIdx}) on the surface`,
     )
   }
+  if (startIdx === 0 && systemHead(session) !== undefined) {
+    throw new Error('compactRegion: the system surface head cannot be compacted')
+  }
   // oxlint-disable-next-line typescript/no-non-null-assertion
   if (!toolPairingBalancedBefore(session, nodes[startIdx]!)) {
     throw new Error(`compactRegion: start seq ${start} is not a balanced boundary (would split a step's tool-call/result pair)`)
@@ -532,8 +554,23 @@ function prepareCompaction(
     ...selection,
     measurement,
     selectedNodes,
-    shadowedTokenCount: selectedNodes.reduce((total, node) => total + node.tokens, 0),
+    shadowedTokenCount: selectedNodes.reduce((total, node) => total + node.heuristicTokens, 0),
+    shadowedRouteTokenCount: selectedNodes.reduce((total, node) => total + node.tokens, 0),
     input: buildSummarizationInput(session, selection.shadowedSeqs, repairClosedStepOrphans),
+  }
+}
+
+/** Compare provider-visible replay data without fresh synthetic repair identities. */
+function summaryRequestIdentity(input: SummarizationInput, session: Session) {
+  return {
+    tools: input.tools,
+    messages: input.messages.map(message => ({
+      role: message.role,
+      content: message.content,
+      ...(message.role === 'tool' ? { toolCallId: message.toolCallId, isError: message.isError } : {}),
+      ...(message.role === 'developer' ? { id: message.id } : {}),
+    })),
+    toolHistory: session.toolHistory(),
   }
 }
 
@@ -544,18 +581,39 @@ async function summarizeCompaction(
   agent: Agent,
   compactionId: CompactionResult['compactionId'],
   sourceCommandId: CommandId | undefined,
+  assertStable: StabilityCheck,
+  allowClosedStepOrphans: boolean,
   signal?: AbortSignal,
 ): Promise<SummarizedCompaction> {
-  const summaryResult = await dependencies.summarize(prepared.input, agent, signal)
+  let summaryResult: SummaryResult
+  const attemptedInputs: Array<ReturnType<typeof summaryRequestIdentity>> = []
+  for (;;) {
+    signal?.throwIfAborted()
+    attemptedInputs.push(summaryRequestIdentity(prepared.input, agent.session))
+    try {
+      summaryResult = await dependencies.summarize(prepared.input, agent, signal)
+      break
+    } catch (error: unknown) {
+      if (signal?.aborted === true) throw error
+      assertStable(dependencies, agent.session, prepared)
+      if (!dependencies.recover(error, agent, prepared.shadowedSeqs, signal)) throw error
+      signal?.throwIfAborted()
+      prepared = prepareCompaction(dependencies, agent.session,
+        validateSurfaceRegion(agent.session, prepared.start, prepared.end, allowClosedStepOrphans),
+        allowClosedStepOrphans)
+      const recovered = summaryRequestIdentity(prepared.input, agent.session)
+      if (attemptedInputs.some(previous => isDeepStrictEqual(previous, recovered))) throw error
+    }
+  }
   const checkpointMessage = createUserMessage({
     content: frameSummary(summaryResult.summary),
     source: compactCheckpointSource(compactionId, sourceCommandId),
   })
   const framedSummaryTokenCount = dependencies.meter.estimateMessage(checkpointMessage)
-  if (framedSummaryTokenCount >= prepared.shadowedTokenCount) {
+  if (framedSummaryTokenCount >= prepared.shadowedRouteTokenCount) {
     throw new SummaryNotSmallerError(
       framedSummaryTokenCount,
-      prepared.shadowedTokenCount,
+      prepared.shadowedRouteTokenCount,
     )
   }
   return {
@@ -618,6 +676,7 @@ function commitCompactionBody(
     end,
     shadowedSeqs,
     shadowedTokenCount,
+    shadowedRouteTokenCount,
     summary,
     provider,
     model,
@@ -634,9 +693,9 @@ function commitCompactionBody(
     ? undefined
     : succeededConvergenceRecord(
       jobAttempt,
-      summarized.measurement.totalTokens - shadowedTokenCount + framedSummaryTokenCount,
-      summarized.measurement.surfaceTokens - shadowedTokenCount + framedSummaryTokenCount,
-      shadowedTokenCount,
+      summarized.measurement.totalTokens - shadowedRouteTokenCount + framedSummaryTokenCount,
+      summarized.measurement.surfaceTokens - shadowedRouteTokenCount + framedSummaryTokenCount,
+      shadowedRouteTokenCount,
       framedSummaryTokenCount,
       summaryEnvelope,
       usage,
@@ -659,7 +718,7 @@ function commitCompactionBody(
   }
   const summaryEvent = session.append('compaction/summary', summaryData)
   session.append('user/message', checkpointMessage, {
-    surfaceOp: { op: 'replace', start, end },
+    surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
     sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
   })
   return {
@@ -811,7 +870,7 @@ function completeCompaction(
 
 /**
  * Reconstruct the last routed request's cacheable prefix for the shadowed
- * region: its system prompt and tool schemas, then the region's own derived
+ * region: its derived system surface head and tool schemas, then the region's own derived
  * messages in surface order. The summarizer appends only the compaction
  * instruction after this, so the call is a genuine prefix of the conversation
  * and reuses the provider's KV cache.
@@ -825,6 +884,8 @@ function buildSummarizationInput(
   repairClosedStepOrphans = false,
 ): SummarizationInput {
   const header = session.requestHeader()
+  const head = systemHead(session)
+  const system = head === undefined ? null : session.deriveEventMessage(head)
   const events = session.snapshotEvents()
   const orphanIds = repairClosedStepOrphans ? closedStepOrphanIds(session) : null
   const regionMessages = shadowedSeqs
@@ -846,9 +907,8 @@ function buildSummarizationInput(
       return [message, ...repairs]
     })
   return {
-    ...header?.system === undefined ? {} : { system: header.system },
     ...header?.tools === undefined ? {} : { tools: header.tools },
-    messages: regionMessages,
+    messages: system === null ? regionMessages : [system, ...regionMessages],
   }
 }
 

@@ -5,12 +5,12 @@ export default defineConfig({
   resolve: {
     alias: [
       {
-        find: /^@deepseek-ai\/dsh-compaction-basic\/src\/(.+)\.ts$/,
-        replacement: `${fileURLToPath(new URL('./src/', import.meta.url))}$1.ts`,
+        find: 'official-alpha2-compaction',
+        replacement: fileURLToPath(new URL('./node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js', import.meta.url)),
       },
       {
-        find: /^@deepseek-ai\/dsh-compaction-basic\/invariant$/,
-        replacement: fileURLToPath(new URL('./src/invariant.ts', import.meta.url)),
+        find: /^@deepseek-ai\/dsh-compaction-basic\/src\/(.+)\.ts$/,
+        replacement: `${fileURLToPath(new URL('./src/', import.meta.url))}$1.ts`,
       },
       {
         find: '@deepseek-ai/dsh-compaction-basic',

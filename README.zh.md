@@ -4,13 +4,13 @@
 
 **收敛式压缩（compaction）后端**：可直接替换 `@deepseek-ai/dsh-compaction-basic`。它保留官方 `BasicCompactionEngine` 的事务和服务契约，并让一次自动触发在有限安全条件下持续分块到压力阈值以下。
 
-`0.1.2-rc.1-convergent.*` 发行线要求整套 DSH 包为 `0.1.2-rc.1`、Cordis 为 `4.0.2`，不能与 DSH `0.1.1-rc.2` 混装。
+`0.2.1-alpha.2-convergent.*` 发行线要求整套 DSH 包为 `0.2.1-alpha.2`、Cordis 为 `4.0.5-alpha.1`，不能与旧版本 DSH 混装。
 
 本包基于 DeepSeek Harness 提交 `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`，遵循 MIT 许可；来源见 [NOTICE.md](NOTICE.md)。
 
 ## 构建与发布
 
-仅推送与 `package.json` 版本严格一致的 `v<version>` tag 会触发 GitHub Actions。工作流会在 Windows Node 24 环境执行依赖锁定安装、类型检查、100% 覆盖率测试、构建和 `npm pack`，然后将与完整源码 SHA 绑定的产物发布到 GitHub Release，同时附带 SHA-256 和 `provenance.json`。Pull Request 和 `main` push 不会触发该工作流。
+仅推送与 `package.json` 版本严格一致的 `v<version>` tag 会触发 GitHub Actions。工作流会在 Windows Node 24 环境执行依赖锁定安装、类型检查、覆盖率测试、构建和 `npm pack`，然后将与完整源码 SHA 绑定的产物发布到 GitHub Release，同时附带 SHA-256 和 `provenance.json`。Pull Request 和 `main` push 不会触发该工作流。
 
 完整替换步骤、验证与回滚方式见[《替换官方压缩插件》](docs/manual/replace-official-plugin.md)。
 
@@ -42,7 +42,7 @@
 
 | Key | 必填 | 含义 |
 |---|---|---|
-| `thresholdRatio` | 否（默认 `0.8`） | 在 `floor(routedContextWindow × ratio)` 处压缩。 |
+| `thresholdRatio` | 否（默认 `0.8`） | 在 `min(floor(routedContextWindow × ratio), window − routed output reserve − headroom)` 处压缩。 |
 | `retainRatio` | 否 | 显式指定近期原文占窗口的比例，与 `retainTokens` 互斥。两者均未配置时，预算为 `min(12000, floor(contextWindow × 0.16))`。 |
 | `retainTokens` | 否 | 逐字保留的近期表层绝对预算；与 `retainRatio` 互斥，并且必须低于已解析阈值。 |
 | `summarizationProvider` | 否（默认 `''`） | 与 `summarizationModel` 一起设置；空对会解析为最新已记录请求目标，再回退到 `AgentOptions` 对。 |
@@ -181,3 +181,11 @@ Rules:
 - **部分不可分单元与仅 envelope 溢出仍不在表层压缩范围内**：恢复无法缩减系统／工具／前缀、拆分不可分的非工具节点，或修复不可剪枝剩余部分仍超出窗口的工具单元。可选 pruner 可以缩减原本不可分工具对内的文本型工具结果主体。
 - **`compactRegion` 要求存在未结束的轮次**：在完全关闭的会话上手动调用会抛出异常（「no open turn」），而不是执行压缩。
 - **摘要失败会保留最新持久表层**：任何替换前，自动路径会记录警告，并携带完整超预算历史继续。如果剪枝已落地，后续摘要失败会从该持久剪枝表层继续。因达到 `maxTokens` 而发生的摘要截断（隐藏推理 token 可能会耗尽该额度）遵循同一规则。
+
+## DSH 0.2.1-alpha.2 适配
+
+本版本仅针对 DSH `0.2.1-alpha.2` 包族。保留插件原有摘要输出 8192 token 和隐式保留量最高 12000 token 的策略；主请求输出预留会扣减可用输入预算。新增可选 `headroomTokens`（顶层和精确模型覆盖均可设置），默认 0，且不会像官方 basic 那样隐式改变 `maxTokens`。迁移依赖官方 headroom 的配置时请显式填写。
+
+所有选区保留 `system/message` 头部，摘要将系统消息计为固定开销并携带工具历史。工具结果使用独立 tool 消息；保留 `compaction/summary-error` 恢复接口。官方已删除 runtime-invariants，因此本包移除旧 `./invariant` companion，profile 应删除对应入口。历史修复只接受当前格式 Session；旧文件应先使用匹配版本的官方迁移并保留原始备份。
+
+验收见 [alpha.2 报告](docs/acceptance/dsh-alpha2/report.md)，仅代表确定性隔离测试，未进行生产部署或真实模型语义验收。

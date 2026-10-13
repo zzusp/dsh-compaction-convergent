@@ -131,7 +131,6 @@ function expansionBudgets(retainTokens: number): readonly number[] {
 }
 
 /** The region transaction's view of this service's dynamically dispatched summarizer. */
-type RegionSummarize = (input: SummarizationInput, agent: Agent, signal?: AbortSignal) => Promise<SummaryResult>
 
 /** Resolve the exact provider/model durably routed for the latest request. */
 function routedTarget(
@@ -168,6 +167,7 @@ const modelPolicy: z<ModelCompactPolicyConfig> = z.object({
   provider: z.string().required(),
   model: z.string().required(),
   thresholdRatio: thresholdRatioSchema,
+  headroomTokens: z.number().step(1).min(0),
   retainRatio: retainRatioSchema,
   retainTokens: retainTokensSchema,
   summarizationProvider: summarizationProviderSchema,
@@ -196,6 +196,7 @@ export class BasicCompactionEngine extends CompactionEngine {
 
   static Config: z<BasicCompactionConfig> = z.object({
     thresholdRatio: thresholdRatioSchema,
+  headroomTokens: z.number().step(1).min(0),
     retainRatio: retainRatioSchema,
     retainTokens: retainTokensSchema,
     summarizationProvider: summarizationProviderSchema,
@@ -347,17 +348,19 @@ export class BasicCompactionEngine extends CompactionEngine {
     config: ResolvedConfig | ReturnType<typeof resolveTargetPolicy>,
     signal?: AbortSignal,
   ): Promise<SummaryResult> {
+    const systemMessages = input.messages.filter(message => message.role === 'system')
+    const replayMessages = input.messages.filter(message => message.role !== 'system')
     const chunks: Array<typeof input.messages> = []
     let chunk: typeof input.messages = []
     let characters = 0
     const pending = new Set<string>()
-    for (const message of input.messages) {
+    for (const message of replayMessages) {
       chunk = [...chunk, message]
       characters += JSON.stringify(message).length
       for (const block of message.content) {
         if (block.type === 'tool-call') pending.add(block.id)
-        if (block.type === 'tool-result') pending.delete(block.toolCallId)
       }
+      if (message.role === 'tool') pending.delete(message.toolCallId)
       if (characters >= 180_000 && pending.size === 0) {
         chunks.push(chunk)
         chunk = []
@@ -375,7 +378,7 @@ export class BasicCompactionEngine extends CompactionEngine {
         this.ctx,
         this.ctx.tokenMeter,
         config,
-        { messages },
+        { ...input, messages: [...systemMessages, ...messages] },
         agent,
         signal,
       ))
@@ -385,7 +388,8 @@ export class BasicCompactionEngine extends CompactionEngine {
       for (let index = 0; index < summaries.length; index += 8) {
         const group = summaries.slice(index, index + 8)
         next.push(await summarizeWithLlm(this.ctx, this.ctx.tokenMeter, config, {
-          messages: group.map((summary, part) => createUserMessage({
+          ...input,
+          messages: [...systemMessages, ...group.map((summary, part) => createUserMessage({
             content: [{
               type: 'text',
               text: `Chronological partial checkpoint ${index + part + 1}:\n${summary.summary
@@ -393,8 +397,8 @@ export class BasicCompactionEngine extends CompactionEngine {
                 .map(block => block.text)
                 .join('\n')}`,
             }],
-            source: { kind: 'plugin', plugin: 'dsh-compaction-convergent-repair' },
-          })),
+            source: { kind: 'user' },
+          }))],
         }, agent, signal))
       }
       summaries = next
@@ -459,14 +463,16 @@ export class BasicCompactionEngine extends CompactionEngine {
   ): Promise<SummaryEnvelopeEstimate | undefined> {
     if (this.summarize !== BasicCompactionEngine.prototype.summarize) return undefined
     const header = agent.session.requestHeader()
+    const first = agent.session.surface.nodes[0]
+    const head = first === undefined ? undefined : agent.session.eventAt(first)
+    const system = head?.type === 'system/message' ? agent.session.deriveEventMessage(head) : null
     return estimateDefaultSummaryEnvelope(
       this.ctx,
       this.ctx.tokenMeter,
       policy,
       {
-        ...header?.system === undefined ? {} : { system: header.system },
         ...header?.tools === undefined ? {} : { tools: header.tools },
-        messages: [],
+        messages: system === null ? [] : [system],
       },
       agent,
       signal,
@@ -744,8 +750,11 @@ export class BasicCompactionEngine extends CompactionEngine {
     // known, both triggers share the same below-threshold completion condition.
     const prune = this.ctx.get('toolResultPruner')
     let context: Awaited<ReturnType<typeof this.ctx.llm.resolveModelInfo>>['context']
+    let defaultMaxTokens: number | undefined
     try {
-      context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context
+      const modelInfo = await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)
+      context = modelInfo.context
+      defaultMaxTokens = modelInfo.defaultMaxTokens
     } catch (error: unknown) {
       if (trigger === 'pressure') throw error
       context = undefined
@@ -762,7 +771,8 @@ export class BasicCompactionEngine extends CompactionEngine {
     let spec: ReturnType<typeof resolveCompactSpec> | undefined
     if (context !== undefined) {
       try {
-        spec = resolveCompactSpec(policy, context.contextWindow)
+        spec = resolveCompactSpec(policy, context.contextWindow,
+          agent.session.requestHeader()?.config.maxTokens ?? defaultMaxTokens ?? 0)
       } catch (error: unknown) {
         if (trigger === 'pressure') throw error
         spec = undefined
@@ -1034,10 +1044,16 @@ export class BasicCompactionEngine extends CompactionEngine {
   }
 
   /** Bind the effective token meter and dynamically dispatched summarizer hook. */
-  private regionDependencies(): { meter: TokenMeter; summarize: RegionSummarize } {
+  private regionDependencies(): Parameters<typeof compactSurfaceRegion>[0] {
     return {
       meter: this.ctx.tokenMeter,
       summarize: (input, owner, abort) => this.summarize(input, owner, abort),
+      recover: (error, agent, sourceEventSeqs, signal) => this.ctx.waterfall('compaction/summary-error', {
+        session: agent.session,
+        sourceEventSeqs,
+        error,
+        ...signal === undefined ? {} : { signal },
+      }, () => false),
     }
   }
 }

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import LlmRuntime, { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, createSystemMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
@@ -49,11 +49,10 @@ function persistedFixture(): { raw: string; sessionId: string } {
   for (let turn = 1; turn <= 4; turn += 1) {
     session.append('turn/start', { turn })
     if (turn === 1) {
+      session.append('system/message', { turn, step: 1, message: createSystemMessage('repair system') }, { surfaceOp: 'append' })
       session.append('request/header', {
         header: {
           config: { provider: 'repair-provider', model: 'repair-model' },
-          system: 'repair system',
-          tools: [],
         },
         reason: 'initial',
       })

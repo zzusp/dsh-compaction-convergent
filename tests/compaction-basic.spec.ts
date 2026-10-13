@@ -22,7 +22,7 @@ import {
   resolveTargetPolicy,
 } from '@deepseek-ai/dsh-compaction-basic/src/config.ts'
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
-import LlmRuntime, { createUserMessage, ToolCallId as CallId, CONTEXT_WINDOW_EXCEEDED_CODE, createToolResultMessage, LlmAdapter , createMessage } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, createSystemMessage, ToolCallId as CallId, CONTEXT_WINDOW_EXCEEDED_CODE, createToolResultMessage, LlmAdapter , createMessage } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   GenerateOptions,
@@ -40,6 +40,14 @@ import { agentEvents, type Agent, type RequestErrorAction } from '@deepseek-ai/d
 import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner'
 
 const SIGNAL = new AbortController().signal
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    test: { kind: 'test' }
+    listener: { kind: 'listener' }
+    rival: { kind: 'rival' }
+  }
+}
+
 const MODEL = 'test-model'
 
 class ContextAdapter extends LlmAdapter {
@@ -96,29 +104,28 @@ function agent(session: Session, model?: string): Agent {
   } as Agent
 }
 
-/** Flatten every text fragment the summarizer received, recursing tool-result blocks. */
+/** Flatten every text fragment the summarizer received across all messages. */
 function summarizedText(input: SummarizationInput): string {
-  const collect = (blocks: readonly ContentBlock[]): string =>
-    blocks.map(block =>
-      block.type === 'text' ? block.text
-        : block.type === 'tool-result' ? collect(block.content)
-          : '').join('\n')
-  return input.messages.map(message => collect(message.content)).join('\n')
+  return input.messages.flatMap(message => message.content)
+    .map(block => block.type === 'text' ? block.text : '').join('\n')
 }
 
 /** A minimal replayed prefix carrying one user message of the given text. */
 function promptInput(text: string): SummarizationInput {
   return { messages: [createUserMessage({
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'test' },
+    source: { kind: 'test' },
   })] }
 }
 
 /** Closed two-message turns followed by one open turn for durable compaction events. */
-function conversation(turns = 4, text = 'fixture '.repeat(40).trim()): Session {
+function conversation(turns = 4, text = 'fixture '.repeat(40).trim(), system?: string): Session {
   const session = Session.create(SessionId(`conversation-${turns}`))
   for (let turn = 1; turn <= turns; turn += 1) {
     session.append('turn/start', { turn })
+    if (turn === 1 && system !== undefined) {
+      session.append('system/message', { turn, step: 1, message: createSystemMessage(system) }, { surfaceOp: 'append' })
+    }
     session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: `${text} user ${turn}` }],
       source: { kind: 'user' },
@@ -131,6 +138,7 @@ function conversation(turns = 4, text = 'fixture '.repeat(40).trim()): Session {
       })
     }
     session.append('assistant/message', {
+      stream: [],
       turn,
       step: 1,
       message: createMessage({
@@ -168,6 +176,7 @@ function toolConversation(): Session {
       })
     }
     session.append('assistant/message', {
+      stream: [],
       turn,
       step: 1,
       message: createMessage({
@@ -216,6 +225,7 @@ function oversizedToolResult(chars = 3_000, withCompactablePrompt = false): Sess
     reason: 'initial',
   })
   session.append('assistant/message', {
+    stream: [],
     turn: 1,
     step: 1,
     message: createMessage({
@@ -301,6 +311,7 @@ describe('compact configuration and defaults', () => {
     const resolved = resolveConfig({})
 
     expect(resolved).toEqual({
+      headroomTokens: 0,
       thresholdRatio: 0.8,
       summarizationProvider: '',
       summarizationModel: '',
@@ -640,6 +651,7 @@ describe('pressure measurement and retention', () => {
       reason: 'initial',
     })
     session.append('assistant/message', {
+      stream: [],
       turn: 1,
       step: 1,
       message: createMessage({
@@ -692,7 +704,7 @@ describe('pressure measurement and retention', () => {
     session.append('request/header', {
       header: {
         config: { provider: MODEL, model: MODEL },
-        system: 's'.repeat(2_000),
+        tools: [{ name: 'bulk', description: 's'.repeat(2_000), parameters: { type: 'object' } }],
       },
       reason: 'resume',
     })
@@ -725,14 +737,14 @@ describe('pressure measurement and retention', () => {
     const empty = Session.create(SessionId('empty'))
     empty.append('turn/start', { turn: 1 })
     empty.append('request/header', {
-      header: { config: { provider: MODEL, model: MODEL }, system: 'x'.repeat(100_000) },
+      header: { config: { provider: MODEL, model: MODEL }, tools: [{ name: 'bulk', description: 'x'.repeat(100_000), parameters: { type: 'object' } }] },
       reason: 'initial',
     })
     expect(await compactIfNeeded(compact, empty)).toBeNull()
 
     const retained = conversation(1)
     retained.append('request/header', {
-      header: { config: { provider: MODEL, model: MODEL }, system: 'x'.repeat(100_000) },
+      header: { config: { provider: MODEL, model: MODEL }, tools: [{ name: 'bulk', description: 'x'.repeat(100_000), parameters: { type: 'object' } }] },
       reason: 'resume',
     })
     await expect(compactIfNeeded(compact, retained))
@@ -821,9 +833,9 @@ describe('pressure measurement and retention', () => {
     const tail = session.surface.nodes.at(-1)!
     session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'surface generation advance' }],
-      source: { kind: 'plugin', plugin: 'test' },
+      source: { kind: 'test' },
     }), {
-      surfaceOp: { op: 'replace', start: tail, end: tail },
+      surfaceOp: { op: 'replace', startSeq: tail, endSeq: tail },
       sourceEventSeqs: [tail],
     })
     await expect(compactIfNeeded(compact, session))
@@ -904,9 +916,9 @@ describe('pressure measurement and retention', () => {
     const messages = session.deriveMessages()
     const calls = new Set<string>()
     for (const message of messages) {
+      if (message.role === 'tool') expect(calls.has(message.toolCallId)).toBe(true)
       for (const block of message.content) {
         if (block.type === 'tool-call') calls.add(block.id)
-        if (block.type === 'tool-result') expect(calls.has(block.toolCallId)).toBe(true)
       }
     }
   })
@@ -940,6 +952,7 @@ describe('pressure measurement and retention', () => {
     session.append('turn/start', { turn: 1 })
     session.append('step/start', { turn: 1, step: 1 })
     session.append('assistant/message', {
+      stream: [],
       turn: 1,
       step: 1,
       message: createMessage({
@@ -967,8 +980,8 @@ describe('pressure measurement and retention', () => {
       SIGNAL,
       true,
     )).resolves.toMatchObject({ shadowedSeqs: nodes })
-    expect(compact.calls[0]!.input.messages.some(message => message.content.some(block =>
-      block.type === 'tool-result' && block.toolCallId === callId))).toBe(true)
+    expect(compact.calls[0]!.input.messages.some(message =>
+      message.role === 'tool' && message.toolCallId === callId)).toBe(true)
     expect(session.snapshotEvents().some(event => event.type === 'tool/result')).toBe(false)
   })
 
@@ -979,6 +992,7 @@ describe('pressure measurement and retention', () => {
     session.append('turn/start', { turn: 1 })
     session.append('step/start', { turn: 1, step: 1 })
     session.append('assistant/message', {
+      stream: [],
       turn: 1,
       step: 1,
       message: createMessage({
@@ -1077,7 +1091,7 @@ describe('optional model-free tool-result pruning', () => {
     expect(await compactIfNeeded(compact, session)).not.toBeNull()
     expect(compact.calls).toHaveLength(1)
     const original = session.snapshotEvents().find(event => event.type === 'tool/result')
-    expect(original?.type === 'tool/result' && original.data.message.content[0].content[0])
+    expect(original?.type === 'tool/result' && original.data.message.content[0])
       .toEqual({ type: 'text', text: 'X'.repeat(3_000) })
     expect(session.snapshotEvents().filter(event =>
       event.type === 'tool/result' && event.surfaceOp !== 'append')).toHaveLength(0)
@@ -1127,17 +1141,18 @@ describe('compaction region transaction', () => {
 
   it('replays the latest routed header so the summarizer reuses the cache', async () => {
     const compact = service()
-    const session = conversation(3)
+    const session = conversation(3, undefined, 'CONVERSATION SYSTEM')
     const tools = [{ name: 'do_thing', description: 'd', parameters: { type: 'object' } }]
     session.append('request/header', {
-      header: { config: { provider: MODEL, model: MODEL }, system: 'CONVERSATION SYSTEM', tools },
+      header: { config: { provider: MODEL, model: MODEL }, tools },
       reason: 'resume',
     })
     const nodes = session.surface.nodes
-    await compact.compactRegion(nodes[0]!, nodes[1]!, agent(session, MODEL), SIGNAL)
+    await compact.compactRegion(nodes[1]!, nodes[2]!, agent(session, MODEL), SIGNAL)
 
     const { input } = compact.calls[0]!
-    expect(input.system).toBe('CONVERSATION SYSTEM')
+    expect(input.messages[0]).toEqual(session.deriveMessages()[0])
+    expect(input.messages[0]).toMatchObject({ role: 'system', content: [{ type: 'text', text: 'CONVERSATION SYSTEM' }] })
     expect(input.tools).toEqual(tools)
     expect(summarizedText(input)).toContain('fixture user 1')
   })
@@ -1294,7 +1309,7 @@ describe('compaction region transaction', () => {
     compact.mutateDuringSummary = () => {
       session.append('user/message', createUserMessage({
         content: [{ type: 'text', text: 'concurrent surface mutation' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       }), { surfaceOp: 'append' })
     }
     const nodes = session.surface.nodes
@@ -1336,6 +1351,7 @@ describe('compaction region transaction', () => {
     }), { surfaceOp: 'append' })
     session.append('step/start', { turn: 1, step: 1 })
     session.append('assistant/message', {
+      stream: [],
       turn: 1,
       step: 1,
       message: createMessage({
@@ -1568,18 +1584,17 @@ describe('default one-shot summarizer', () => {
           },
         },
       ],
-      source: { kind: 'plugin', plugin: 'test' },
+      source: { kind: 'test' },
     })
     await compact.runSummarize({
-      system: 'REPLAYED SYSTEM',
       tools,
-      messages: [prefix],
+      messages: [createSystemMessage('REPLAYED SYSTEM'), prefix],
     }, agent(conversation(1), MODEL))
 
-    expect(adapter.lastOptions?.system).toBe('REPLAYED SYSTEM')
+    expect(adapter.lastOptions?.messages[0]).toMatchObject({ role: 'system', content: [{ type: 'text', text: 'REPLAYED SYSTEM' }] })
     expect(adapter.lastOptions?.tools).toEqual(tools)
     const messages = adapter.lastOptions?.messages ?? []
-    expect(messages[0]).toEqual(prefix)
+    expect(messages[1]).toEqual(prefix)
     const last = messages.at(-1)?.content[0]
     const lastText = last?.type === 'text' ? last.text : ''
     expect(lastText).toContain('Write concise English engineering prose.')
@@ -1608,12 +1623,11 @@ describe('default one-shot summarizer', () => {
     ctx.llm.registerAdapter(['policy-summary'], policyAdapter)
     const prefix: Message = createUserMessage({
       content: [{ type: 'text', text: 'warm prefix' }],
-      source: { kind: 'plugin', plugin: 'test' },
+      source: { kind: 'test' },
     })
 
     const output = await compact.runSummarize({
-      system: 'WARM SYSTEM',
-      messages: [prefix],
+      messages: [createSystemMessage('WARM SYSTEM'), prefix],
     }, agent(conversation(1), 'fallback'))
 
     expect(output).toMatchObject({
@@ -1625,9 +1639,9 @@ describe('default one-shot summarizer', () => {
       provider: 'policy-summary',
       model: 'policy-summary',
       maxTokens: 222,
-      system: 'WARM SYSTEM',
+      messages: [expect.objectContaining({ role: 'system', content: [{ type: 'text', text: 'WARM SYSTEM' }] }), prefix, expect.anything()],
     })
-    expect(policyAdapter.lastOptions?.messages[0]).toEqual(prefix)
+    expect(policyAdapter.lastOptions?.messages[1]).toEqual(prefix)
   })
 
   it('resolves the latest routed provider/model before the AgentOptions pair', async () => {
@@ -1746,7 +1760,8 @@ describe('default one-shot summarizer', () => {
       .rejects.toMatchObject({ code: 'UNSUPPORTED_CONTENT' })
   })
 
-  it('rejects image summary output nested in a tool result', async () => {
+  it('rejects malformed legacy tool-result summary output containing an image', async () => {
+    // Deliberately model legacy, untyped provider data: alpha.2 has no nested result blocks.
     const { compact } = await summarizerHarness([{
       type: 'tool-result',
       toolCallId: CallId('summary-tool'),
@@ -1760,9 +1775,9 @@ describe('default one-shot summarizer', () => {
           height: 1,
         },
       }],
-    }])
+    }] as unknown as ContentBlock[])
     await expect(compact.runSummarize(promptInput('history'), agent(conversation(1), MODEL)))
-      .rejects.toMatchObject({ code: 'UNSUPPORTED_CONTENT' })
+      .rejects.toThrow('summarization produced no text summary content')
   })
 })
 
@@ -1789,12 +1804,11 @@ describe('summary input capacity convergence', () => {
     const contextWindow = 2_000
     const run = async (withEnvelope: boolean) => {
       const { ctx, adapter, compact } = capacityService(contextWindow)
-      const session = conversation(5, 'x'.repeat(400))
+      const session = conversation(5, 'x'.repeat(400), withEnvelope ? 'system '.repeat(180) : undefined)
       if (withEnvelope) {
         session.append('request/header', {
           header: {
             config: { provider: MODEL, model: MODEL },
-            system: 'system '.repeat(180),
             tools: [{
               name: 'large_tool',
               description: 'description '.repeat(120),
@@ -1820,23 +1834,22 @@ describe('summary input capacity convergence', () => {
     expect(enveloped.result?.shadowedSeqs.length).toBeLessThan(plain.result!.shadowedSeqs.length)
     expect(enveloped.adapter.requests).toHaveLength(1)
     expect(enveloped.adapter.requests[0]).toMatchObject({
-      system: expect.stringContaining('system'),
+      messages: expect.arrayContaining([expect.objectContaining({ role: 'system', content: [{ type: 'text', text: 'system '.repeat(180) }] })]),
       tools: [expect.objectContaining({ name: 'large_tool' })],
       maxTokens: 64,
     })
     const dispatched = enveloped.adapter.requests[0]!
     const summaryHeader = enveloped.ctx.tokenMeter.measure(enveloped.session, {
       config: { provider: MODEL, model: MODEL, maxTokens: 64 },
-      ...dispatched.system === undefined ? {} : { system: dispatched.system },
       ...dispatched.tools === undefined ? {} : { tools: dispatched.tools },
     })
     const fixedTokens = summaryHeader.totalTokens - summaryHeader.surfaceTokens
     const dispatchedInputTokens = fixedTokens + dispatched.messages.reduce(
-      (total, message) => total + enveloped.ctx.tokenMeter.estimateMessage(message),
+      (total, message) => total + enveloped.ctx.tokenMeter.estimateMessage(message.id === undefined ? createUserMessage({ content: message.content, source: { kind: 'user' } }) : message),
       0,
     )
     expect(dispatchedInputTokens + 64).toBeLessThanOrEqual(contextWindow)
-    const nextNode = enveloped.measurement.nodes[enveloped.result!.shadowedSeqs.length]!
+    const nextNode = enveloped.measurement.nodes[enveloped.result!.shadowedSeqs.length + 1]!
     expect(dispatchedInputTokens + nextNode.tokens + 64).toBeGreaterThan(contextWindow)
     expect(enveloped.session.snapshotEvents().filter(event => event.type === 'compaction/start').length)
       .toBeGreaterThan(enveloped.adapter.requests.length)
@@ -1855,11 +1868,10 @@ describe('summary input capacity convergence', () => {
       maxTokens: 64,
       compactionRetries: 3,
     })
-    const session = conversation(8, 'x'.repeat(400))
+    const session = conversation(8, 'x'.repeat(400), 'system '.repeat(100))
     session.append('request/header', {
       header: {
         config: { provider: MODEL, model: MODEL },
-        system: 'system '.repeat(100),
         tools: [{
           name: 'large_tool',
           description: 'description '.repeat(60),
@@ -2049,9 +2061,8 @@ describe('summary input capacity convergence', () => {
         context: { contextWindow },
       })
       return (await compact.runSummarize({
-        system,
         tools: [{ name: 'tool', description: system, parameters: { type: 'object' } }],
-        ...promptInput('history'),
+        messages: [createSystemMessage(system), ...promptInput('history').messages],
       }, agent(conversation(1), MODEL))).summaryEnvelope!.capacityKey
     }
 
@@ -2140,9 +2151,9 @@ describe('summary input capacity convergence', () => {
     const tail = session.surface.nodes.at(-1)!
     session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'advance capacity cache generation' }],
-      source: { kind: 'plugin', plugin: 'test' },
+      source: { kind: 'test' },
     }), {
-      surfaceOp: { op: 'replace', start: tail, end: tail },
+      surfaceOp: { op: 'replace', startSeq: tail, endSeq: tail },
       sourceEventSeqs: [tail],
     })
     await expect(compactIfNeeded(compact, session, 'context-overflow'))
@@ -2401,9 +2412,9 @@ describe('automatic listener and loader composition', () => {
     const messages = session.deriveMessages()
     const calls = new Set<string>()
     for (const message of messages) {
+      if (message.role === 'tool') expect(calls.has(message.toolCallId)).toBe(true)
       for (const block of message.content) {
         if (block.type === 'tool-call') calls.add(block.id)
-        if (block.type === 'tool-result') expect(calls.has(block.toolCallId)).toBe(true)
       }
     }
   })

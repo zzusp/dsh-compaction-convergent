@@ -10,6 +10,8 @@ import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
 export interface CompactionPolicyConfig {
   /** Compact at this fraction of the model's context window. Defaults to `0.8`. */
   thresholdRatio?: number
+  /** Extra input headroom after the routed output reservation. Defaults to zero. */
+  headroomTokens?: number
   /** Explicit recent-context fraction; mutually exclusive with `retainTokens`. */
   retainRatio?: number
   /** Absolute recent-context budget; when both forms are omitted, use min(12000, window * 0.16). */
@@ -51,6 +53,7 @@ export type ResolvedRetention =
 /** Validated policy fields shared before and after exact-target matching. */
 interface ResolvedPolicyFields {
   readonly thresholdRatio: number
+  readonly headroomTokens: number
   readonly summarizationProvider: string
   readonly summarizationModel: string
   readonly maxTokens: number
