@@ -1,6 +1,6 @@
 {
   "name": "@zzusp/dsh-compaction-convergent",
-  "version": "0.1.2-rc.1-convergent.1",
+  "version": "0.2.1-alpha.2-convergent.1",
   "description": "Convergent replacement for the DeepSeek Harness basic compaction backend",
   "type": "module",
   "main": "lib/index.js",
@@ -9,10 +9,6 @@
     ".": {
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
-    },
-    "./invariant": {
-      "types": "./lib/invariant.d.ts",
-      "default": "./lib/invariant.js"
     },
     "./repair": {
       "types": "./lib/repair.d.ts",
@@ -27,7 +23,8 @@
     "NOTICE.md",
     "README.md",
     "README.zh.md",
-    "docs/manual/replace-official-plugin.md"
+    "docs/manual/replace-official-plugin.md",
+    "docs/acceptance/dsh-alpha2/report.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -45,16 +42,15 @@
     "node": ">=24"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-agent": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-commands": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-compaction": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-compaction-tool-result-pruner": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-invariants": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-session": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-token-meter": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-util-values": "^0.1.2-rc.1"
+    "@deepseek-ai/cordis": "^4.0.5-alpha.1",
+    "@deepseek-ai/dsh-agent": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-commands": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-compaction": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-compaction-tool-result-pruner": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-session": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-token-meter": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-util-values": "0.2.1-alpha.2"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-compaction-tool-result-pruner": {
@@ -65,28 +61,28 @@
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "4.0.2",
-    "@deepseek-ai/cordis-plugin-include": "1.0.7",
-    "@deepseek-ai/cordis-plugin-loader": "1.0.3",
-    "@deepseek-ai/dsh-agent": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-agent-loop": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-agent-loop-testkit": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-attachment": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-commands": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-compaction": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-compaction-tool-result-pruner": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-invariants": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-llm": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-llm-retry": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-session": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-session-projection": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-token-meter": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-util-values": "0.1.2-rc.1",
+    "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "@deepseek-ai/cordis-plugin-include": "1.0.10-alpha.1",
+    "@deepseek-ai/cordis-plugin-loader": "1.0.6-alpha.1",
+    "@deepseek-ai/dsh-agent": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-agent-loop": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-agent-loop-testkit": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-attachment": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-commands": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-compaction": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-compaction-basic": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-compaction-image-offload": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-compaction-tool-result-pruner": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-llm-retry": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-session": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-session-projection": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-token-meter": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-util-values": "0.2.1-alpha.2",
     "@types/node": "^24.0.0",
     "@vitest/coverage-v8": "^4.1.8",
     "typescript": "^6.0.3",
-    "vite-tsconfig-paths": "^6.1.1",
     "vitest": "^4.1.8"
   }
 }

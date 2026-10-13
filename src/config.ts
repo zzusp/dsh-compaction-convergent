@@ -26,6 +26,7 @@ const DEFAULT_RETAIN_TOKEN_CAP = 12_000
 /** Fields shared by top-level defaults and exact-target overrides. */
 const POLICY_CONFIG_KEYS = [
   'thresholdRatio',
+  'headroomTokens',
   'retainRatio',
   'retainTokens',
   'summarizationProvider',
@@ -86,6 +87,7 @@ export function resolveConfig(config: BasicCompactionConfig = {}): ResolvedConfi
 
   return deepFreeze({
     thresholdRatio,
+    headroomTokens: config.headroomTokens ?? 0,
     ...retention,
     summarizationProvider: config.summarizationProvider ?? '',
     summarizationModel: config.summarizationModel ?? '',
@@ -114,6 +116,7 @@ export function resolveTargetPolicy(
   return deepFreeze({
     target: { provider: target.provider, model: target.model },
     thresholdRatio: override?.thresholdRatio ?? config.thresholdRatio,
+    headroomTokens: override?.headroomTokens ?? config.headroomTokens,
     ...resolveRetention(override ?? {}, inheritedRetention),
     summarizationProvider: override?.summarizationProvider ?? config.summarizationProvider,
     summarizationModel: override?.summarizationModel ?? config.summarizationModel,
@@ -127,11 +130,13 @@ export function resolveTargetPolicy(
  * Scale one routed policy into concrete token budgets for its model capacity.
  * @param policy - merged policy for the exact routed target.
  * @param contextWindow - positive adapter-owned capacity for that target.
+ * @param reservedCompletionTokens - effective routed request output reservation.
  * @returns detached immutable pressure and retention budgets.
  */
 export function resolveCompactSpec(
   policy: ResolvedTargetPolicy,
   contextWindow: number,
+  reservedCompletionTokens = 0,
 ): ResolvedCompactSpec {
   const targetKey = `${policy.target.provider}/${policy.target.model}`
   if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
@@ -140,10 +145,20 @@ export function resolveCompactSpec(
       `BasicCompactionConfig: contextWindow (${contextWindow}) must be a positive integer`,
     )
   }
-  const thresholdTokens = Math.floor(contextWindow * policy.thresholdRatio)
+  if (!Number.isInteger(reservedCompletionTokens) || reservedCompletionTokens < 0) {
+    throw new TargetPressureConfigError(targetKey, 'reservedCompletionTokens must be a non-negative integer')
+  }
+  const messageBudgetTokens = contextWindow - reservedCompletionTokens
+  const pressureBudgetTokens = messageBudgetTokens - policy.headroomTokens
+  if (pressureBudgetTokens <= 0) {
+    throw new TargetPressureConfigError(targetKey,
+      `compaction-convergent: ${targetKey} has no pressure budget after reserving `
+      + `${reservedCompletionTokens} output and ${policy.headroomTokens} headroom tokens of ${contextWindow}`)
+  }
+  const thresholdTokens = Math.floor(Math.min(contextWindow * policy.thresholdRatio, pressureBudgetTokens))
   const retainTokens = policy.retainTokens ?? (policy.retainRatio === undefined
-    ? Math.min(DEFAULT_RETAIN_TOKEN_CAP, Math.floor(contextWindow * DEFAULT_RETAIN_RATIO))
-    : Math.floor(contextWindow * policy.retainRatio))
+    ? Math.min(DEFAULT_RETAIN_TOKEN_CAP, Math.floor(messageBudgetTokens * DEFAULT_RETAIN_RATIO))
+    : Math.floor(messageBudgetTokens * policy.retainRatio))
   if (retainTokens >= thresholdTokens) {
     throw new TargetPressureConfigError(
       targetKey,
@@ -155,6 +170,7 @@ export function resolveCompactSpec(
     target: { ...policy.target },
     contextWindow,
     thresholdRatio: policy.thresholdRatio,
+    headroomTokens: policy.headroomTokens,
     thresholdTokens,
     retainTokens,
     summarizationProvider: policy.summarizationProvider,
@@ -230,6 +246,7 @@ function validatePolicy(
   name: string,
 ): void {
   const thresholdRatio = config.thresholdRatio
+  if (config.headroomTokens !== undefined) assertNonNegativeInteger(`${name}.headroomTokens`, config.headroomTokens)
   const retainRatio = config.retainRatio
   const retainTokens = config.retainTokens
   const maxTokens = config.maxTokens

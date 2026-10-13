@@ -14,7 +14,7 @@ import {
   LlmError,
 } from '@deepseek-ai/dsh-llm'
 import type {
-  ContentBlock, FinishReason, GenerateOptions, LlmResolvedModelInfo, Message, TokenUsage, ToolSchema,
+  ContentBlock, FinishReason, GenerateOptions, LlmResolvedModelInfo, Message, RequestMessage, TokenUsage, ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
@@ -87,11 +87,9 @@ const CHECKPOINT_PREAMBLE =
  * compaction instruction is then the only novel input.
  */
 export interface SummarizationInput {
-  /** The conversation's own system prompt, reused for prefix-cache alignment; absent for a system-less request. */
-  readonly system?: string
   /** The conversation's tool schemas, reused for prefix-cache alignment; absent when the request carried none. */
   readonly tools?: readonly ToolSchema[]
-  /** The shadowed region, in surface order, that precedes the compaction instruction. */
+  /** The derived system head, when present, followed by the shadowed region in surface order. */
   readonly messages: readonly Message[]
 }
 
@@ -136,7 +134,7 @@ export interface SummaryEnvelopeEstimate {
 }
 
 /** Versioned description of the TokenMeter calls used to price this envelope. */
-const TOKEN_METER_STRATEGY = 'dsh-token-meter:measure+estimateMessage:v1'
+const TOKEN_METER_STRATEGY = 'dsh-token-meter:measure+estimateMessage:system-head:v2'
 
 /** A summary range that cannot be submitted to its resolved model as one request. */
 export class SummaryInputTooLargeError extends LlmError {
@@ -200,7 +198,7 @@ function tokenCountMatch(message: string, patterns: readonly RegExp[]): number |
 function compactionInstructionMessage(): Message {
   return createUserMessage({
     content: [{ type: 'text', text: COMPACTION_INSTRUCTION }],
-    source: { kind: 'plugin', plugin: 'dsh-compaction-convergent' },
+    source: { kind: 'user' },
   })
 }
 
@@ -218,11 +216,13 @@ function estimateSummaryEnvelope(
   const contextWindow = modelInfo.context?.contextWindow
   const envelope = meter.measure(agent.session, {
     config: { provider, model, maxTokens },
-    ...input.system === undefined ? {} : { system: input.system },
     ...input.tools === undefined ? {} : { tools: [...input.tools] },
   })
-  const fixedEnvelopeTokens = Math.max(0, envelope.totalTokens - envelope.surfaceTokens)
-  const replayMessageTokens = input.messages.reduce(
+  const system = input.messages[0]?.role === 'system' ? input.messages[0] : undefined
+  const systemTokens = system === undefined ? 0 : meter.estimateMessage(system)
+  const fixedEnvelopeTokens = Math.max(0, envelope.totalTokens - envelope.surfaceTokens) + systemTokens
+  const replayMessages = system === undefined ? input.messages : input.messages.slice(1)
+  const replayMessageTokens = replayMessages.reduce(
     (total, message) => total + meter.estimateMessage(message),
     0,
   )
@@ -236,7 +236,7 @@ function estimateSummaryEnvelope(
     reasoningEffort: summaryReasoningEffort(modelInfo) ?? null,
     fixedEnvelopeTokens,
     instruction: COMPACTION_INSTRUCTION,
-    system: input.system ?? null,
+    system: system?.content ?? null,
     tools: input.tools ?? null,
     tokenMeterStrategy: TOKEN_METER_STRATEGY,
   })).digest('hex')
@@ -309,15 +309,15 @@ export async function summarizeWithLlm(
   const modelInfo = await ctx.llm.resolveModelInfo(target.provider, target.model, signal)
   const reasoningEffort = summaryReasoningEffort(modelInfo)
   const instruction = compactionInstructionMessage()
-  const messages: Message[] = [
+  const messages: RequestMessage[] = [
     ...input.messages,
-    instruction,
+    { role: 'user', content: instruction.content },
   ]
   const options: GenerateOptions = {
     provider: target.provider,
     model: target.model,
     messages,
-    ...input.system === undefined ? {} : { system: input.system },
+    toolHistory: agent.session.toolHistory(),
     ...input.tools === undefined ? {} : { tools: [...input.tools] },
     maxTokens: config.maxTokens,
     sessionId: agent.session.id,
@@ -414,9 +414,7 @@ function finishError(finish: FinishReason): Error | undefined {
   switch (finish.kind) {
     case 'error':
     case 'aborted': {
-      const error = new Error(finish.failure.message) as Error & { code?: string }
-      error.code = finish.failure.code
-      return error
+      return new LlmError(finish.failure.message, finish.failure.code, finish.failure)
     }
     case 'max-tokens': {
       const error = new Error('summarization truncated at the token cap (incomplete checkpoint)') as Error & { code?: string }

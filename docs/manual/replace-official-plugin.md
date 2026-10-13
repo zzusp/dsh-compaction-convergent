@@ -4,7 +4,7 @@
 
 ## 1. 下载 Release 产物
 
-要求 Node.js 24、DSH `0.1.2-rc.1` 和 Cordis `4.0.2`，并将 `<version>` 替换为目标 Release（例如 `v0.1.2-rc.1-convergent.1`）：
+要求 Node.js 24、DSH `0.2.1-alpha.2` 和 Cordis `4.0.5-alpha.1`，并将 `<version>` 替换为目标 Release（例如 `v0.2.1-alpha.2-convergent.1`）：
 
 ```powershell
 $releaseDir = Join-Path $PWD 'dsh-compaction-release'
@@ -111,3 +111,7 @@ Pop-Location
 - 完成后删除 repair entry、恢复 Resident 配置并停止临时 Web。
 
 repair 永不覆盖输入或既有输出。真实模型、网络、上下文窗口、摘要变小或重载校验任一失败时，不会生成修复输出。
+
+## 7. alpha.2 Web preset 注意事项
+
+Web 的 standard、ptc、cordis preset 各自在 `config.plugins` 的隔离 compaction group 内注册 basic。顶层 `compaction-basic` patch 不会遍历这些 preset 的 plugins。应保留目标 preset 当前完整列表，递归 group 的 config 数组，仅把 basic entry 的 name 改为 `@zzusp/dsh-compaction-convergent`，再以原 preset id 写回完整 plugins。不要用仅包含压缩插件的列表覆盖整个 preset；这会丢失工具与策略。已有用户自定义 preset 应基于当前值变换，不应由官方默认列表覆盖。验收时检查每个实际使用 preset 的服务提供方，而不只是根配置。

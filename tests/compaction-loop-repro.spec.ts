@@ -8,13 +8,8 @@ import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import InvariantRegistry from '@deepseek-ai/dsh-invariants'
-import * as SessionInvariant from '@deepseek-ai/dsh-session/invariant'
-import * as AgentInvariant from '@deepseek-ai/dsh-agent/invariant'
-import * as AgentLoopInvariant from '@deepseek-ai/dsh-agent-loop/invariant'
 import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
-import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import * as LlmRetry from '@deepseek-ai/dsh-llm-retry'
 import { Session, SessionId, type SessionEvent, type SurfaceEvent } from '@deepseek-ai/dsh-session'
 
@@ -156,19 +151,11 @@ class OverflowRecoveryAdapter extends LlmAdapter {
   }
 }
 
-async function mountInvariants(ctx: Context): Promise<void> {
-  await ctx.plugin(InvariantRegistry)
-  await ctx.plugin(SessionInvariant)
-  await ctx.plugin(AgentInvariant)
-  await ctx.plugin(AgentLoopInvariant)
-}
-
 async function harness(toolSteps: number): Promise<{ ctx: Context; compact: ReproCompactionEngine }> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
-  await mountInvariants(ctx)
   await ctx.plugin(AgentLoop, { agents: [] })
-  await ctx.plugin(SessionProjectionRegistry)
+
   await ctx.plugin(TokenMeter)
   ctx.llm.registerAdapter(['mock'], new StepwiseToolAdapter(toolSteps))
   ctx.tools.register(defineContentToolFixture({
@@ -215,6 +202,7 @@ function overflowHistorySeed(): SessionEvent[] {
     }), { surfaceOp: 'append' })
     session.append('step/start', { turn, step: 1 })
     session.append('assistant/message', {
+      stream: [],
       turn,
       step: 1,
       message: createMessage({
@@ -239,7 +227,7 @@ describe('CBR-001: a real-loop checkpoint is a valid boundary on both sides', ()
       ...await next(), provider: 'mock', model: 'mock',
     }))
     try {
-      const agent = ctx.agentLoop.create(SessionId('routed-pressure'), {
+      const agent = await ctx.agentLoop.create(SessionId('routed-pressure'), {
         provider: 'unconfigured-agent-fallback',
         model: 'unconfigured-agent-fallback',
       })
@@ -260,7 +248,7 @@ describe('CBR-001: a real-loop checkpoint is a valid boundary on both sides', ()
   it('runs automatic pressure between the completed tool step and the next step', async () => {
     const { ctx } = await harness(8)
     try {
-      const agent = ctx.agentLoop.create(SessionId('post-step-order'), { provider: 'mock', model: 'mock' })
+      const agent = await ctx.agentLoop.create(SessionId('post-step-order'), { provider: 'mock', model: 'mock' })
       agent.followup(createUserMessage({ content: [{ type: 'text', text: 'do tool work' }], source: { kind: 'user' } }))
       await waitForIdle(ctx, agent)
 
@@ -292,7 +280,7 @@ describe('CBR-001: a real-loop checkpoint is a valid boundary on both sides', ()
   it('the head checkpoint the loop lands is a balanced cut on both sides', async () => {
     const { ctx } = await harness(8)
     try {
-      const agent = ctx.agentLoop.create(SessionId('repro'), { provider: 'mock', model: 'mock' })
+      const agent = await ctx.agentLoop.create(SessionId('repro'), { provider: 'mock', model: 'mock' })
       agent.followup(createUserMessage({ content: [{ type: 'text', text: 'do a long multi-step task' }], source: { kind: 'user' } }))
       await waitForIdle(ctx, agent)
 
@@ -329,9 +317,8 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
       const ctx = new Context()
       const adapter = new OverflowRecoveryAdapter(delivery)
       await mountAgentLoopTestDependencies(ctx)
-      await mountInvariants(ctx)
       await ctx.plugin(AgentLoop, { agents: [] })
-      await ctx.plugin(SessionProjectionRegistry)
+
       await ctx.plugin(TokenMeter)
       ctx.llm.registerAdapter(['mock'], adapter)
       ctx.on('agent/request', async (_payload, next) => ({
@@ -408,9 +395,8 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
     const ctx = new Context()
     const adapter = new OverflowRecoveryAdapter('thrown', false, 2)
     await mountAgentLoopTestDependencies(ctx)
-    await mountInvariants(ctx)
     await ctx.plugin(AgentLoop, { agents: [] })
-    await ctx.plugin(SessionProjectionRegistry)
+
     await ctx.plugin(TokenMeter)
     ctx.llm.registerAdapter(['mock'], adapter)
     await ctx.plugin(BasicCompactionEngine, {
@@ -454,10 +440,9 @@ describe('context-overflow recovery across the real loop and compaction-basic', 
     const ctx = new Context()
     const adapter = new OverflowRecoveryAdapter('thrown', true)
     await mountAgentLoopTestDependencies(ctx)
-    await mountInvariants(ctx)
     await ctx.plugin(LlmRetry)
     await ctx.plugin(AgentLoop, { agents: [] })
-    await ctx.plugin(SessionProjectionRegistry)
+
     await ctx.plugin(TokenMeter)
     ctx.llm.registerAdapter(['mock'], adapter)
     await ctx.plugin(BasicCompactionEngine, {
